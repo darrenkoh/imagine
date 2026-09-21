@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#07070b" />
+  <title>Imagine</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="gate">
+    <div class="gate-card">
+      <h1>Imagine</h1>
+      <p>Enter PIN to generate on Spark</p>
+      <input id="pinInput" type="password" inputmode="text" autocomplete="one-time-code" placeholder="PIN" />
+      <button class="btn btn-primary" id="pinBtn">Unlock</button>
+      <p id="pinErr" class="hidden" style="color:var(--err);margin-top:10px">Wrong PIN</p>
+      <p class="trust-link"><a href="/trust">First time on iPhone? Trust the cert</a></p>
+    </div>
+  </div>
+
+  <header class="appbar">
+    <h1>Imagine</h1>
+  </header>
+
+  <div class="layout">
+    <section>
+      <div class="card">
+        <div class="field">
+          <label>Prompt</label>
+          <textarea id="prompt" rows="8" placeholder="A neon koi swimming through misty bamboo at dusk…"></textarea>
+        </div>
+        <label>Task</label>
+        <div class="chips" id="taskChips"></div>
+        <div id="editPanel" class="field hidden">
+          <label>Source image</label>
+          <input id="editFile" type="file" accept="image/*" />
+          <div id="editPreviewWrap" class="edit-preview hidden">
+            <img id="editPreview" alt="Source" />
+            <button type="button" class="btn btn-ghost" id="clearEdit">Clear</button>
+          </div>
+          <label class="strength-label">Strength <span id="strengthVal">0.65</span></label>
+          <input id="strength" type="range" min="0.15" max="1" step="0.05" value="0.65" />
+          <p class="hint">Low = subtle tweak · High = bold redesign</p>
+        </div>
+        <label>Aspect</label>
+        <div class="chips" id="aspectChips"></div>
+        <label>Mode</label>
+        <div class="chips" id="modeChips"></div>
+        <details class="advanced" id="advancedPanel">
+          <summary>Advanced</summary>
+          <div class="advanced-body">
+            <div class="field">
+              <label>Negative</label>
+              <input id="negative" type="text" placeholder="blurry, low quality, watermark" />
+            </div>
+            <label>Style</label>
+            <div class="chips" id="styleChips"></div>
+            <label>Framing</label>
+            <div class="chips" id="framingChips"></div>
+            <label>Output</label>
+            <div class="chips" id="rgbaChips"></div>
+            <p id="rgbaHint" class="hint hidden">Transparent PNG with alpha (checkerboard preview)</p>
+            <div class="field seed-steps">
+              <div class="seed-steps-row">
+                <div class="seed-steps-col">
+                  <label>Steps</label>
+                  <input id="steps" type="number" min="1" max="100" value="28" />
+                </div>
+                <div class="seed-steps-col seed-col">
+                  <label>Seed</label>
+                  <input id="seed" type="number" placeholder="random" />
+                </div>
+                <button class="btn btn-ghost btn-icon seed-dice" id="shuffleSeed" type="button" title="Shuffle">🎲</button>
+              </div>
+            </div>
+          </div>
+        </details>
+        <div class="gen-row">
+          <button class="btn btn-primary" id="generateBtn">Generate</button>
+          <button class="btn btn-ghost hidden" id="cancelBtn" type="button">Cancel</button>
+        </div>
+        <div id="progressWrap" class="hidden">
+          <div class="progress"><span id="progressLabel">Generating…</span><span id="elapsed">0s</span></div>
+          <div class="bar"><i id="progressBar" style="width:0%"></i></div>
+        </div>
+      </div>
+
+      <div class="card hidden" id="resultWrap">
+        <label>Result</label>
+        <img id="resultImg" alt="result" />
+        <button type="button" id="resultPrompt" class="result-prompt hidden" title="Tap to use this prompt"></button>
+        <p id="resultPromptHint" class="muted result-prompt-hint hidden">Tap prompt to reuse</p>
+        <div class="actions">
+          <a class="btn btn-ghost" id="downloadBtn" download>Download</a>
+          <button class="btn btn-ghost" id="regenBtn">Regenerate</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:10px;gap:8px;flex-wrap:wrap">
+          <label style="margin:0">Gallery</label>
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <button class="btn btn-ghost" id="selectModeBtn" style="min-height:40px;font-size:14px">Select</button>
+            <button class="btn btn-ghost hidden" id="deleteSelectedBtn" style="min-height:40px;font-size:14px;color:#ff6b7a">Delete</button>
+            <button class="btn btn-ghost" id="nsfwBlurToggle" style="min-height:40px;font-size:14px" title="Toggle NSFW blur">Blur NSFW</button>
+            <button class="btn btn-ghost" id="clearAll" style="min-height:40px;font-size:14px;color:#ff6b7a">Clear all</button>
+            <button class="btn btn-ghost" id="refreshGallery" style="min-height:40px;font-size:14px">Refresh</button>
+          </div>
+        </div>
+        <div class="chips gallery-filters" id="galleryFilters"></div>
+        <div class="gallery" id="gallery"></div>
+        <p id="galleryEmpty" class="gallery-empty hidden">No images yet — generate something.</p>
+      </div>
+    </section>
+  </div>
+
+  
+  <div id="sheetBackdrop" class="sheet-backdrop hidden" aria-hidden="true"></div>
+  <div id="sheet" class="sheet hidden" role="dialog" aria-modal="true" aria-label="Image details">
+    <div class="sheet-handle" aria-hidden="true"></div>
+    <button type="button" class="sheet-close" id="sheetClose" aria-label="Close">×</button>
+    <div class="sheet-body">
+      <div class="sheet-media">
+        <img id="sheetImg" class="sheet-img" alt="Selected" />
+      </div>
+      <div class="sheet-side">
+        <p id="sheetMeta" class="sheet-meta muted"></p>
+        <button type="button" id="sheetPrompt" class="sheet-prompt hidden" title="Tap to use this prompt"></button>
+        <p id="sheetPromptHint" class="muted sheet-prompt-hint hidden">Tap prompt to reuse · long-press a thumb to reuse without opening</p>
+        <div class="sheet-actions">
+          <a class="btn btn-ghost" id="sheetDownload" download>Download</a>
+          <button type="button" class="btn btn-ghost" id="sheetReuse">Reuse</button>
+          <button type="button" class="btn btn-ghost" id="sheetUseSource">Edit</button>
+          <button type="button" class="btn btn-ghost" id="sheetStar">★ Star</button>
+          <button type="button" class="btn btn-ghost sheet-danger" id="sheetDelete">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true">
+    <button type="button" class="lightbox-close" id="lightboxClose" aria-label="Close">×</button>
+    <img id="lightboxImg" alt="Full screen" />
+  </div>
+  
+  <footer class="status-footer" id="statusFooter">
+    <div id="statusPill">checking…</div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+data/
+certs/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.pid
+*.log
+.DS_Store
