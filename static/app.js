@@ -24,8 +24,21 @@
   let rgba = localStorage.getItem("imagine_rgba") === "1";
   // default ON (missing key => framed)
   let framing = localStorage.getItem("imagine_framing") !== "0";
-  let task = "create"; // create | edit
+  let task = "create"; // create | edit | animate
   let editImageId = null;
+  let animateImageId = null;
+  let h3Video = false;
+  let h3Known = false;
+  let h3Detail = "";
+  const DURATIONS = [5, 6, 10];
+  const RESOLUTIONS = [
+    { id: "fast", label: "Fast" },
+    { id: "768p", label: "768p" },
+  ];
+  let duration = Number(localStorage.getItem("imagine_h3_duration") || 5);
+  if (!DURATIONS.includes(duration)) duration = 5;
+  let resolution = localStorage.getItem("imagine_h3_resolution") || "fast";
+  if (!RESOLUTIONS.some((mode) => mode.id === resolution)) resolution = "fast";
   let strength = Number(localStorage.getItem('imagine_strength') || 0.65);
   let galleryFilter = localStorage.getItem('imagine_gallery_filter') || 'all';
   let selectMode = false;
@@ -58,7 +71,13 @@
     const ct = res.headers.get("content-type") || "";
     const body = ct.includes("application/json") ? await res.json() : await res.text();
     if (!res.ok) {
-      const msg = typeof body === "object" ? JSON.stringify(body) : body;
+      let msg = res.statusText;
+      if (body && typeof body === "object") {
+        const detail = body.detail;
+        msg = typeof detail === "string" ? detail : JSON.stringify(detail || body);
+      } else if (typeof body === "string" && body) {
+        msg = body;
+      }
       throw new Error(msg || res.statusText);
     }
     return body;
@@ -89,6 +108,7 @@
     renderTaskChips();
     renderFramingChips();
     renderRgbaChips();
+    renderAnimateChips();
   }
 
 
@@ -99,6 +119,7 @@
     [
       { id: "create", label: "Create" },
       { id: "edit", label: "Edit" },
+      { id: "animate", label: "Animate" },
     ].forEach((m) => {
       const b = document.createElement("button");
       b.type = "button";
@@ -106,19 +127,113 @@
       b.textContent = m.label;
       b.onclick = () => {
         task = m.id;
-        const panel = $("editPanel");
-        if (panel) panel.classList.toggle("hidden", task !== "edit");
-        if (task === "edit") {
-          $("prompt").placeholder = "Describe the edit — e.g. change background to sunset beach…";
-        } else {
-          $("prompt").placeholder = "A neon koi swimming through misty bamboo at dusk…";
-        }
         refreshChips();
       };
       el.appendChild(b);
     });
-    const panel = $("editPanel");
-    if (panel) panel.classList.toggle("hidden", task !== "edit");
+    syncTaskPanels();
+  }
+
+  function renderAnimateChips() {
+    const dur = $("durationChips");
+    if (dur) {
+      dur.innerHTML = "";
+      DURATIONS.forEach((sec) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "chip" + (duration === sec ? " active" : "");
+        b.textContent = sec + "s";
+        b.onclick = () => {
+          duration = sec;
+          localStorage.setItem("imagine_h3_duration", String(sec));
+          refreshChips();
+        };
+        dur.appendChild(b);
+      });
+    }
+    const res = $("resolutionChips");
+    if (res) {
+      res.innerHTML = "";
+      RESOLUTIONS.forEach((mode) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "chip" + (resolution === mode.id ? " active" : "");
+        b.textContent = mode.label;
+        b.onclick = () => {
+          resolution = mode.id;
+          localStorage.setItem("imagine_h3_resolution", mode.id);
+          refreshChips();
+        };
+        res.appendChild(b);
+      });
+    }
+  }
+
+  function syncTaskPanels() {
+    const edit = $("editPanel");
+    const anim = $("animatePanel");
+    const still = $("stillControls");
+    if (edit) edit.classList.toggle("hidden", task !== "edit");
+    if (anim) anim.classList.toggle("hidden", task !== "animate");
+    if (still) still.classList.toggle("hidden", task === "animate");
+    const label = $("promptLabel");
+    if (label) label.textContent = task === "animate" ? "Motion" : "Prompt";
+    const gen = $("generateBtn");
+    if (gen && !gen.disabled) gen.textContent = task === "animate" ? "Animate" : "Generate";
+    const prompt = $("prompt");
+    if (prompt) {
+      if (task === "animate") {
+        prompt.placeholder = "Slow push-in, leaves stir, light shifts across the scene…";
+      } else if (task === "edit") {
+        prompt.placeholder = "Describe the edit — e.g. change background to sunset beach…";
+      } else {
+        prompt.placeholder = "A neon koi swimming through misty bamboo at dusk…";
+      }
+    }
+    const hint = $("h3Hint");
+    if (hint) {
+      hint.textContent = h3Video
+        ? "Local H3 uses this image as the first frame. Leave motion blank for a gentle default."
+        : (h3Detail || "Local H3 is not ready.");
+    }
+  }
+
+  async function useAnimateFile(file) {
+    if (!file) return;
+    task = "animate";
+    refreshChips();
+    try {
+      const up = await uploadEditFile(file);
+      animateImageId = up.id;
+      $("animatePreview").src = up.url + "?t=" + Date.now();
+      $("animatePreviewWrap").classList.remove("hidden");
+      $("prompt").focus();
+    } catch (err) {
+      alert("Upload failed: " + (err.message || err));
+      animateImageId = null;
+    }
+  }
+
+  async function useJobAsAnimateSource(job) {
+    if (!job) return;
+    const url = job.image || (job.id ? `/api/images/${job.id}.png` : "");
+    if (!url) {
+      alert("This item has no still to animate");
+      return;
+    }
+    const blob = await fetch(url, { headers: pinHeaders(), credentials: "same-origin" }).then((r) => {
+      if (!r.ok) throw new Error("could not read the image");
+      return r.blob();
+    });
+    const file = new File([blob], `${job.id || "still"}.png`, { type: blob.type || "image/png" });
+    const text = (job.user_prompt || job.prompt || "").trim();
+    await useAnimateFile(file);
+    if (text && !$("prompt").value.trim()) {
+      $("prompt").value = text;
+      autoGrowPrompt();
+    }
+    if (typeof closeSheet === "function") closeSheet();
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function renderRgbaChips() {
@@ -242,6 +357,10 @@
       const ready = s.worker && s.worker.ready;
       const loading = s.worker && s.worker.loading;
       const h3 = s.h3_running;
+      h3Video = !!s.h3_video;
+      h3Detail = s.h3_detail || "";
+      h3Known = true;
+      syncTaskPanels();
       const mem = s.memory && s.memory.mem_available_gb != null ? `${s.memory.mem_available_gb}G free` : "";
       const cpu = s.cpu_percent != null ? `CPU ${Math.round(s.cpu_percent)}%` : "";
       const gpu = s.gpu_percent != null ? `GPU ${Math.round(s.gpu_percent)}%` : "";
@@ -363,10 +482,10 @@
     if (empty) empty.classList.toggle("hidden", items.length > 0);
     items.forEach((it) => {
       const d = document.createElement("div");
-      d.className = "gitem" + (it.nsfw || it.spicy ? " nsfw" : "") + (it.rgba ? " rgba-thumb" : "") + (selectedIds.has(it.id) ? " selected" : "");
+      d.className = "gitem" + (it.nsfw || it.spicy ? " nsfw" : "") + (it.rgba ? " rgba-thumb" : "") + (it.kind === "video" ? " video" : "") + (selectedIds.has(it.id) ? " selected" : "");
       d.dataset.id = it.id;
       const img = document.createElement("img");
-      img.src = it.image;
+      if (it.image) img.src = it.image;
       img.alt = it.prompt || "";
       img.loading = "lazy";
       if (it.rgba) img.classList.add("checker");
@@ -437,6 +556,12 @@
       }
       d.appendChild(img);
       d.appendChild(star);
+      if (it.kind === "video") {
+        const badge = document.createElement("div");
+        badge.className = "play-badge";
+        badge.textContent = "▶";
+        d.appendChild(badge);
+      }
       if (!selectMode) d.appendChild(del);
       g.appendChild(d);
     });
@@ -470,10 +595,30 @@
     sheetJob = job;
     lastJob = job;
     const url = job.image || `/api/images/${job.id}.png`;
-    $("sheetImg").src = url + "?t=" + Date.now();
-    $("sheetDownload").href = url;
-    $("sheetDownload").download = `imagine-${job.id}.png`;
+    const isVideo = job.kind === "video" && job.video;
+    const sheetVid = $("sheetVideo");
+    if (isVideo && sheetVid) {
+      $("sheetImg").classList.add("hidden");
+      sheetVid.classList.remove("hidden");
+      sheetVid.poster = job.image || "";
+      sheetVid.src = job.video;
+      $("sheetDownload").href = job.video;
+      $("sheetDownload").download = `imagine-${job.id}.mp4`;
+    } else {
+      if (sheetVid) {
+        sheetVid.pause();
+        sheetVid.classList.add("hidden");
+        sheetVid.removeAttribute("src");
+      }
+      $("sheetImg").classList.remove("hidden");
+      $("sheetImg").src = url + "?t=" + Date.now();
+      $("sheetDownload").href = url;
+      $("sheetDownload").download = `imagine-${job.id}.png`;
+    }
     const bits = [];
+    if (job.model) bits.push(job.model);
+    if (job.duration) bits.push(`${job.duration}s`);
+    if (job.resolution) bits.push(job.resolution);
     if (job.width && job.height) bits.push(`${job.width}×${job.height}`);
     if (job.steps != null) bits.push(`${job.steps} steps`);
     if (job.seed != null) bits.push(`seed ${job.seed}`);
@@ -501,6 +646,12 @@
     $("sheet").classList.add("hidden");
     $("sheetBackdrop").classList.add("hidden");
     $("sheetImg").src = "";
+    const sheetVid = $("sheetVideo");
+    if (sheetVid) {
+      sheetVid.pause();
+      sheetVid.removeAttribute("src");
+      sheetVid.load();
+    }
     sheetJob = null;
     document.body.style.overflow = "";
   }
@@ -524,8 +675,16 @@
     if (rw) rw.classList.add("hidden");
     const ri = $("resultImg");
     if (ri) {
+      ri.classList.remove("hidden");
       ri.removeAttribute("src");
       ri.src = "";
+    }
+    const rv = $("resultVideo");
+    if (rv) {
+      rv.pause();
+      rv.classList.add("hidden");
+      rv.removeAttribute("src");
+      rv.load();
     }
     const rp = $("resultPrompt");
     if (rp) {
@@ -541,10 +700,30 @@
   function showResult(job) {
     lastJob = job;
     $("resultWrap").classList.remove("hidden");
+    const isVideo = job.kind === "video" && job.video;
     const url = job.image || `/api/images/${job.id}.png`;
-    $("resultImg").src = url + "?t=" + Date.now();
-    $("downloadBtn").href = url;
-    $("downloadBtn").download = `imagine-${job.id}.png`;
+    const rv = $("resultVideo");
+    if (isVideo && rv) {
+      $("resultImg").classList.add("hidden");
+      rv.classList.remove("hidden");
+      rv.poster = job.image || "";
+      rv.src = job.video;
+      $("downloadBtn").href = job.video;
+      $("downloadBtn").download = `imagine-${job.id}.mp4`;
+      if (job.image_id) animateImageId = job.image_id;
+    } else {
+      if (rv) {
+        rv.pause();
+        rv.classList.add("hidden");
+        rv.removeAttribute("src");
+      }
+      $("resultImg").classList.remove("hidden");
+      $("resultImg").src = url + "?t=" + Date.now();
+      $("downloadBtn").href = url;
+      $("downloadBtn").download = `imagine-${job.id}.png`;
+    }
+    const animBtn = $("animateResultBtn");
+    if (animBtn) animBtn.classList.toggle("hidden", !!isVideo);
     if (job.seed != null) $("seed").value = job.seed;
     const text = (job.user_prompt || job.prompt || "").trim();
     const rp = $("resultPrompt");
@@ -580,7 +759,97 @@
   }
 
 
+  function beginProgress() {
+    $("generateBtn").disabled = true;
+    cancelRequested = false;
+    activeJobId = null;
+    const cancelBtn = $("cancelBtn");
+    if (cancelBtn) cancelBtn.classList.remove("hidden");
+    clearResult();
+    $("progressWrap").classList.remove("hidden");
+    const bar = $("progressBar");
+    bar.classList.remove("indeterminate");
+    bar.style.width = "0%";
+    const t0 = Date.now();
+    timer = setInterval(() => {
+      $("elapsed").textContent = Math.round((Date.now() - t0) / 1000) + "s";
+    }, 250);
+    $("progressLabel").textContent = "Starting… 0%";
+    return bar;
+  }
+
+  function endProgress() {
+    clearInterval(timer);
+    $("generateBtn").disabled = false;
+    activeJobId = null;
+    cancelRequested = false;
+    syncTaskPanels();
+    const cancelBtn = $("cancelBtn");
+    if (cancelBtn) cancelBtn.classList.add("hidden");
+    setTimeout(() => $("progressWrap").classList.add("hidden"), 2500);
+  }
+
+  async function animate() {
+    if (h3Known && !h3Video) {
+      alert(h3Detail || "Local H3 is not ready.");
+      return;
+    }
+    if (!animateImageId) {
+      alert("Drop a screenshot or choose an image first");
+      const drop = $("animateDrop");
+      if (drop) drop.focus();
+      return;
+    }
+    const prompt = $("prompt").value.trim();
+    const bar = beginProgress();
+    bar.classList.add("indeterminate");
+    $("progressLabel").textContent = "H3 · starting";
+    try {
+      const started = await api("/api/animate", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          image_id: animateImageId,
+          duration,
+          resolution,
+        }),
+      });
+      const jobId = started.id;
+      activeJobId = jobId;
+      let job = started;
+      while (job.status === "queued" || job.status === "running") {
+        if (cancelRequested) {
+          try { await api(`/api/jobs/${jobId}/cancel`, { method: "POST", body: "{}" }); } catch (_) {}
+          throw new Error("Cancelled");
+        }
+        if (job.status === "cancelled") throw new Error("Cancelled");
+        await new Promise((r) => setTimeout(r, 1000));
+        job = await api("/api/jobs/" + jobId);
+        const remote = (job.provider_status || "").trim();
+        const ahead = Number(job.queue_ahead);
+        let msg = remote && remote !== "queued" ? `H3 · ${remote}` : "H3 · starting";
+        if (Number.isFinite(ahead) && ahead > 0) msg += ` · #${ahead + 1} ahead`;
+        $("progressLabel").textContent = msg;
+      }
+      if (job.status === "error") {
+        throw new Error(typeof job.error === "string" ? job.error : JSON.stringify(job.error || "failed"));
+      }
+      if (job.status === "cancelled") throw new Error("Cancelled");
+      bar.classList.remove("indeterminate");
+      bar.style.width = "100%";
+      showResult(job);
+      loadGallery();
+      $("progressLabel").textContent = `Done · ${job.elapsed_s || "?"}s`;
+    } catch (e) {
+      bar.classList.add("indeterminate");
+      $("progressLabel").textContent = "Failed: " + (e.message || e);
+    } finally {
+      endProgress();
+    }
+  }
+
   async function generate() {
+    if (task === "animate") return animate();
     const prompt = $("prompt").value.trim();
     if (!prompt) {
       $("prompt").focus();
@@ -605,21 +874,7 @@
       image_id: task === "edit" ? editImageId : null,
       strength: task === "edit" ? Number(strength) || 0.65 : undefined,
     };
-    $("generateBtn").disabled = true;
-    cancelRequested = false;
-    activeJobId = null;
-    const cancelBtn = $("cancelBtn");
-    if (cancelBtn) cancelBtn.classList.remove("hidden");
-    clearResult();
-    $("progressWrap").classList.remove("hidden");
-    const bar = $("progressBar");
-    bar.classList.remove("indeterminate");
-    bar.style.width = "0%";
-    const t0 = Date.now();
-    timer = setInterval(() => {
-      $("elapsed").textContent = Math.round((Date.now() - t0) / 1000) + "s";
-    }, 250);
-    $("progressLabel").textContent = "Starting… 0%";
+    const bar = beginProgress();
     try {
       const started = await api("/api/generate", { method: "POST", body: JSON.stringify(body) });
       const jobId = started.id;
@@ -667,13 +922,7 @@
       bar.classList.add("indeterminate");
       $("progressLabel").textContent = "Failed: " + (e.message || e);
     } finally {
-      clearInterval(timer);
-      $("generateBtn").disabled = false;
-      activeJobId = null;
-      cancelRequested = false;
-      const cancelBtn = $("cancelBtn");
-      if (cancelBtn) cancelBtn.classList.add("hidden");
-      setTimeout(() => $("progressWrap").classList.add("hidden"), 2500);
+      endProgress();
     }
   }
 
@@ -731,6 +980,10 @@
 
   $("refreshGallery").onclick = loadGallery;
   $("regenBtn").onclick = () => {
+    if ((lastJob && lastJob.kind === "video") || task === "animate") {
+      animate();
+      return;
+    }
     shuffleSeed();
     generate();
   };
@@ -784,6 +1037,114 @@
       $("editPreview").src = "";
     };
   }
+
+  if ($("animateBrowse") && $("animateFile")) {
+    $("animateBrowse").onclick = () => $("animateFile").click();
+    $("animateFile").onchange = async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      await useAnimateFile(file);
+      e.target.value = "";
+    };
+  }
+  if ($("clearAnimate")) {
+    $("clearAnimate").onclick = () => {
+      animateImageId = null;
+      if ($("animateFile")) $("animateFile").value = "";
+      $("animatePreviewWrap").classList.add("hidden");
+      $("animatePreview").src = "";
+    };
+  }
+  const animateDrop = $("animateDrop");
+  if (animateDrop) {
+    animateDrop.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      animateDrop.classList.add("dragover");
+    });
+    animateDrop.addEventListener("dragleave", () => animateDrop.classList.remove("dragover"));
+    animateDrop.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepth = 0;
+      animateDrop.classList.remove("dragover");
+      const overlay = $("dropOverlay");
+      if (overlay) overlay.classList.add("hidden");
+      const file = firstImageFile(e.dataTransfer && e.dataTransfer.files);
+      if (file) await useAnimateFile(file);
+    });
+  }
+  if ($("animateResultBtn")) {
+    $("animateResultBtn").onclick = () => {
+      useJobAsAnimateSource(lastJob).catch((e) => alert("Could not use this still: " + (e.message || e)));
+    };
+  }
+  if ($("sheetAnimate")) {
+    $("sheetAnimate").onclick = () => {
+      useJobAsAnimateSource(sheetJob).catch((e) => alert("Could not use this still: " + (e.message || e)));
+    };
+  }
+
+  function firstImageFile(fileList) {
+    if (!fileList) return null;
+    for (const file of fileList) {
+      if (file && file.type && file.type.startsWith("image/")) return file;
+    }
+    return null;
+  }
+
+  let dragDepth = 0;
+  function dragHasFiles(e) {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    return Array.from(types).indexOf("Files") !== -1;
+  }
+  document.addEventListener("dragenter", (e) => {
+    if ($("gate") && !$("gate").classList.contains("hidden")) return;
+    if (!dragHasFiles(e)) return;
+    dragDepth += 1;
+    const overlay = $("dropOverlay");
+    if (overlay) overlay.classList.remove("hidden");
+  });
+  document.addEventListener("dragover", (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+  });
+  document.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) {
+      const overlay = $("dropOverlay");
+      if (overlay) overlay.classList.add("hidden");
+    }
+  });
+  document.addEventListener("dragend", () => {
+    dragDepth = 0;
+    const overlay = $("dropOverlay");
+    if (overlay) overlay.classList.add("hidden");
+  });
+  document.addEventListener("drop", async (e) => {
+    dragDepth = 0;
+    const overlay = $("dropOverlay");
+    if (overlay) overlay.classList.add("hidden");
+    if ($("gate") && !$("gate").classList.contains("hidden")) return;
+    const file = firstImageFile(e.dataTransfer && e.dataTransfer.files);
+    if (!file) return;
+    e.preventDefault();
+    await useAnimateFile(file);
+  });
+  document.addEventListener("paste", async (e) => {
+    if ($("gate") && !$("gate").classList.contains("hidden")) return;
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (!file) return;
+        e.preventDefault();
+        await useAnimateFile(file);
+        return;
+      }
+    }
+  });
 
 
   // Strength slider

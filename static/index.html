@@ -28,11 +28,28 @@
     <section>
       <div class="card">
         <div class="field">
-          <label>Prompt</label>
+          <label id="promptLabel">Prompt</label>
           <textarea id="prompt" rows="8" placeholder="A neon koi swimming through misty bamboo at dusk…"></textarea>
         </div>
         <label>Task</label>
         <div class="chips" id="taskChips"></div>
+        <div id="animatePanel" class="field hidden">
+          <label>Still</label>
+          <div id="animateDrop" class="dropzone" tabindex="0">
+            <p>Drop a screenshot or image here, or paste one</p>
+            <button type="button" class="btn btn-ghost" id="animateBrowse">Choose file</button>
+            <input id="animateFile" type="file" accept="image/*" class="sr-only" />
+          </div>
+          <div id="animatePreviewWrap" class="edit-preview hidden">
+            <img id="animatePreview" alt="Still to animate" />
+            <button type="button" class="btn btn-ghost" id="clearAnimate">Clear</button>
+          </div>
+          <label>Length</label>
+          <div class="chips" id="durationChips"></div>
+          <label>Resolution</label>
+          <div class="chips" id="resolutionChips"></div>
+          <p id="h3Hint" class="hint">Local H3 uses this image as the first frame.</p>
+        </div>
         <div id="editPanel" class="field hidden">
           <label>Source image</label>
           <input id="editFile" type="file" accept="image/*" />
@@ -44,6 +61,7 @@
           <input id="strength" type="range" min="0.15" max="1" step="0.05" value="0.65" />
           <p class="hint">Low = subtle tweak · High = bold redesign</p>
         </div>
+        <div id="stillControls">
         <label>Aspect</label>
         <div class="chips" id="aspectChips"></div>
         <label>Mode</label>
@@ -77,6 +95,7 @@
             </div>
           </div>
         </details>
+        </div>
         <div class="gen-row">
           <button class="btn btn-primary" id="generateBtn">Generate</button>
           <button class="btn btn-ghost hidden" id="cancelBtn" type="button">Cancel</button>
@@ -90,11 +109,13 @@
       <div class="card hidden" id="resultWrap">
         <label>Result</label>
         <img id="resultImg" alt="result" />
+        <video id="resultVideo" class="hidden" controls playsinline preload="metadata"></video>
         <button type="button" id="resultPrompt" class="result-prompt hidden" title="Tap to use this prompt"></button>
         <p id="resultPromptHint" class="muted result-prompt-hint hidden">Tap prompt to reuse</p>
         <div class="actions">
           <a class="btn btn-ghost" id="downloadBtn" download>Download</a>
           <button class="btn btn-ghost" id="regenBtn">Regenerate</button>
+          <button class="btn btn-ghost" id="animateResultBtn" type="button">Animate</button>
         </div>
       </div>
     </section>
@@ -113,7 +134,7 @@
         </div>
         <div class="chips gallery-filters" id="galleryFilters"></div>
         <div class="gallery" id="gallery"></div>
-        <p id="galleryEmpty" class="gallery-empty hidden">No images yet — generate something.</p>
+        <p id="galleryEmpty" class="gallery-empty hidden">Nothing yet — generate a still, or drop one to animate.</p>
       </div>
     </section>
   </div>
@@ -126,6 +147,7 @@
     <div class="sheet-body">
       <div class="sheet-media">
         <img id="sheetImg" class="sheet-img" alt="Selected" />
+        <video id="sheetVideo" class="sheet-video hidden" controls playsinline preload="metadata"></video>
       </div>
       <div class="sheet-side">
         <p id="sheetMeta" class="sheet-meta muted"></p>
@@ -135,6 +157,7 @@
           <a class="btn btn-ghost" id="sheetDownload" download>Download</a>
           <button type="button" class="btn btn-ghost" id="sheetReuse">Reuse</button>
           <button type="button" class="btn btn-ghost" id="sheetUseSource">Edit</button>
+          <button type="button" class="btn btn-ghost" id="sheetAnimate">Animate</button>
           <button type="button" class="btn btn-ghost" id="sheetStar">★ Star</button>
           <button type="button" class="btn btn-ghost sheet-danger" id="sheetDelete">Delete</button>
         </div>
@@ -151,6 +174,7 @@
     <div id="statusPill">checking…</div>
   </footer>
 
+  <div id="dropOverlay" class="drop-overlay hidden">Drop to animate with local H3</div>
   <script src="/static/app.js"></script>
 </body>
 </html>

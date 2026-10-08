@@ -6,19 +6,27 @@ cd "$ROOT"
 export IMAGINE_DATA="${IMAGINE_DATA:-$ROOT/data}"
 export IMAGINE_PIN="${IMAGINE_PIN:-haku}"
 export IMAGINE_WORKER_URL="${IMAGINE_WORKER_URL:-http://127.0.0.1:7861}"
-mkdir -p "$IMAGINE_DATA/images" "$IMAGINE_DATA/jobs" "$ROOT/certs"
+mkdir -p "$IMAGINE_DATA/images" "$IMAGINE_DATA/jobs" "$IMAGINE_DATA/videos" "$IMAGINE_DATA/uploads" "$ROOT/certs"
 
 .venv/bin/python - <<'PY'
 import sys
 need = []
-for m in ("fastapi", "uvicorn", "httpx", "pydantic", "cryptography"):
+for mod, pkg in (
+    ("fastapi", "fastapi"),
+    ("uvicorn", "uvicorn"),
+    ("httpx", "httpx"),
+    ("pydantic", "pydantic"),
+    ("cryptography", "cryptography"),
+    ("multipart", "python-multipart"),
+    ("PIL", "pillow"),
+):
     try:
-        __import__(m)
+        __import__(mod)
     except ImportError:
-        need.append(m if m != "cryptography" else "cryptography")
+        need.append(pkg)
 if need:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *need, "pillow"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *need])
 PY
 
 .venv/bin/python -c 'from tls import ensure_certs; print("certs:", ensure_certs())'

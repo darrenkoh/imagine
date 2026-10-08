@@ -251,6 +251,80 @@ textarea { min-height: 96px; resize: vertical; line-height: 1.4; }
   border-radius: 10px; background: #111; border: 1px solid var(--border);
 }
 .edit-preview.hidden { display: none; }
+.dropzone {
+  border: 1.5px dashed var(--border);
+  border-radius: 14px;
+  padding: 18px 14px;
+  text-align: center;
+  background: var(--panel2);
+  color: var(--muted);
+}
+.dropzone p { margin: 0 0 10px; font-size: 14px; line-height: 1.4; }
+.dropzone .btn { min-height: 40px; font-size: 15px; width: auto; }
+.dropzone.dragover {
+  border-color: var(--accent);
+  background: #1a1628;
+  color: var(--text);
+}
+.sr-only {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  max-width: 1px;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(7, 7, 11, 0.72);
+  color: #fff;
+  font-size: 1.25rem;
+  font-weight: 650;
+  text-align: center;
+  pointer-events: none;
+  border: 3px dashed #8b6cff;
+}
+.drop-overlay.hidden { display: none; }
+#resultWrap video, .sheet-video {
+  width: 100%;
+  border-radius: 12px;
+  display: block;
+  background: #000;
+  max-height: 70vh;
+}
+.sheet-video { max-height: 60vh; }
+.gitem .play-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  pointer-events: none;
+}
 input[type="file"] {
   width: 100%; font-size: 14px; color: var(--muted);
 }

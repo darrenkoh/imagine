@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import os
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -24,12 +26,36 @@ IMAGES = DATA / "images"
 JOBS = DATA / "jobs"
 PROGRESS = DATA / "progress"
 UPLOADS = DATA / "uploads"
+VIDEOS = DATA / "videos"
 STATIC = ROOT / "static"
 IMAGES.mkdir(parents=True, exist_ok=True)
 JOBS.mkdir(parents=True, exist_ok=True)
 PROGRESS.mkdir(parents=True, exist_ok=True)
 UPLOADS.mkdir(parents=True, exist_ok=True)
+VIDEOS.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA / "prompt_history.json"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Fill missing env vars from a local .env. Never overrides the process env."""
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(ROOT / ".env")
 
 PIN = os.environ.get("IMAGINE_PIN", "haku")
 # Nudge the model to keep subjects fully in frame (Qwen often crops heads/limbs).
@@ -85,6 +111,16 @@ STYLE_NEGATIVES = {
 }
 WORKER_URL = os.environ.get("IMAGINE_WORKER_URL", "http://127.0.0.1:7861")
 COOKIE = "imagine_pin"
+# Local MiniMax H3 via antirez/h3.c (Apple Silicon). Not the cloud API.
+H3_RESOLUTIONS = ("fast", "768p")
+H3_DURATION_MIN = 1
+H3_DURATION_MAX = 15
+H3_MAX_PIXELS = 768 * 1344
+H3_DEFAULT_MOTION = (
+    "The still image comes alive with natural, subtle motion. "
+    "Keep the subject, composition, lighting, and any on-screen text unchanged. "
+    "Gentle ambient movement only."
+)
 
 app = FastAPI(title="Imagine")
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -103,6 +139,13 @@ class GenerateBody(BaseModel):
     framing: bool = True  # auto crop-nudge suffix; off for tight crops
     image_id: Optional[str] = None  # uploaded file id under data/uploads
     strength: float = 0.65  # edit intensity 0.15–1.0
+
+
+class AnimateBody(BaseModel):
+    prompt: Optional[str] = ""
+    image_id: str = Field(..., min_length=1)
+    duration: int = 5
+    resolution: str = "fast"
 
 
 def _check_pin(
@@ -128,9 +171,14 @@ def _write_job(job_id: str, data: dict) -> None:
 
 
 
+def _job_kind(job: dict) -> str:
+    return job.get("kind") or "image"
+
+
 def _queue_stats(job_id: str, job: dict) -> dict:
-    """How many active jobs are ahead, plus a rough ETA in seconds."""
+    """How many active jobs of the same kind are ahead, plus a rough ETA in seconds."""
     my_t = float(job.get("created_at") or job.get("updated_at") or 0)
+    kind = _job_kind(job)
     ahead = 0
     # average elapsed from recent done jobs for ETA
     dones: list[float] = []
@@ -138,6 +186,8 @@ def _queue_stats(job_id: str, job: dict) -> dict:
         try:
             o = json.loads(p.read_text())
         except Exception:
+            continue
+        if _job_kind(o) != kind:
             continue
         st = o.get("status")
         if st in ("queued", "running") and o.get("id") != job_id:
@@ -163,6 +213,14 @@ def _read_job(job_id: str) -> dict:
     if not p.exists():
         raise HTTPException(404, "job not found")
     job = json.loads(p.read_text())
+    # Video jobs report their own provider status. The image worker's
+    # progress file is unrelated and must not flip them back to queued.
+    if _job_kind(job) == "video":
+        if job.get("status") in ("queued", "running"):
+            job.update(_queue_stats(job_id, job))
+        elif job.get("status") == "done":
+            job["pct"] = 100
+        return job
     # Merge live denoising progress from shared volume (worker writes this)
     if job.get("status") in ("queued", "running"):
         pp = PROGRESS / f"{job_id}.json"
@@ -472,11 +530,14 @@ async def auth(request: Request) -> JSONResponse:
 async def status(request: Request) -> dict:
     # Soft gate: allow unauthenticated status but omit pin confirmation
     wh = await _worker_health()
+    h3_ok, h3_detail = _h3_ready()
     return {
         "ok": True,
         "time": time.time(),
         "worker": wh,
         "h3_running": _docker_running("vllm-minimax-h3"),
+        "h3_video": h3_ok,
+        "h3_detail": h3_detail,
         "worker_container": _docker_running("imagine-qwen-worker"),
         "memory": _meminfo(),
         "cpu_percent": _cpu_percent(),
@@ -527,6 +588,460 @@ def api_upload_get(name: str, _: None = Depends(_check_pin)):
     if not path.exists():
         raise HTTPException(404, "missing")
     return FileResponse(path, media_type="image/png")
+
+
+def _safe_upload_id(image_id: str) -> str:
+    return "".join(c for c in (image_id or "") if c.isalnum())[:24]
+
+
+def _h3_paths() -> tuple[Path, Path]:
+    binary = Path(os.environ.get("H3_BIN", str(Path.home() / "src/h3.c/h3"))).expanduser()
+    model = Path(os.environ.get("H3_MODEL_DIR", str(Path.home() / "src/h3.c/MiniMax-H3"))).expanduser()
+    return binary, model
+
+
+def _h3_ready() -> tuple[bool, str]:
+    """Local h3.c binary plus MiniMax-H3 weights. No cloud key is involved."""
+    binary, model = _h3_paths()
+    if not binary.is_file():
+        return False, f"Local h3 binary not found at {binary}. Build it in ~/src/h3.c."
+    if not os.access(binary, os.X_OK):
+        return False, f"Local h3 binary is not executable: {binary}"
+    if not model.is_dir():
+        return False, f"MiniMax-H3 weights not found at {model}."
+    if not any(model.rglob("*.safetensors")):
+        return False, f"MiniMax-H3 weights are incomplete in {model}."
+    return True, ""
+
+
+def _ram_gb() -> Optional[float]:
+    """Physical RAM in GiB. Read once, without forking, so the event loop never blocks on sysctl."""
+    try:
+        if os.uname().sysname == "Darwin":
+            import ctypes
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            size = ctypes.c_uint64()
+            length = ctypes.c_size_t(ctypes.sizeof(size))
+            if libc.sysctlbyname(b"hw.memsize", ctypes.byref(size), ctypes.byref(length), None, 0) != 0:
+                return None
+            return size.value / (1024 ** 3)
+        info = Path("/proc/meminfo").read_text()
+        for line in info.splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / (1024 ** 2)
+    except Exception:
+        return None
+    return None
+
+
+_RAM_GB = _ram_gb()
+
+
+def _h3_layers() -> int:
+    raw = os.environ.get("H3_LAYERS", "").strip()
+    if raw:
+        return max(1, int(raw))
+    # 32 GB machines need the lighter stack from the local quick-test preset.
+    if _RAM_GB is not None and _RAM_GB <= 40:
+        return 45
+    return 50
+
+
+def _h3_steps() -> int:
+    raw = os.environ.get("H3_STEPS", "").strip()
+    if raw:
+        return max(2, int(raw))
+    return 20
+
+
+def _h3_ssd() -> bool:
+    raw = os.environ.get("H3_SSD_STREAMING")
+    if raw is not None and raw.strip() != "":
+        return raw.strip().lower() not in ("0", "false", "no")
+    return _RAM_GB is None or _RAM_GB <= 40
+
+
+def _h3_canvas(src_w: int, src_h: int, mode: str) -> tuple[int, int]:
+    """Snap a still to a legal h3 canvas: multiples of 32, within the pixel cap.
+
+    Fast keeps the long side at 512. 768p uses the released 768×1344 budget.
+    The nearest 32-grid size keeps the screenshot's aspect ratio.
+    """
+    if src_w < 1 or src_h < 1:
+        raise HTTPException(400, "image is empty")
+    long_cap = 512 if mode == "fast" else 1344
+    max_pixels = 512 * 512 if mode == "fast" else H3_MAX_PIXELS
+    aspect = src_w / src_h
+    if src_w >= src_h:
+        ideal_w = float(long_cap)
+        ideal_h = ideal_w / aspect
+    else:
+        ideal_h = float(long_cap)
+        ideal_w = ideal_h * aspect
+    if ideal_w * ideal_h > max_pixels:
+        scale = math.sqrt(max_pixels / (ideal_w * ideal_h))
+        ideal_w *= scale
+        ideal_h *= scale
+    base_w = max(32, int(ideal_w) // 32 * 32)
+    base_h = max(32, int(ideal_h) // 32 * 32)
+    best: tuple[tuple[float, int], int, int] | None = None
+    for w in range(max(32, base_w - 64), base_w + 97, 32):
+        for h in range(max(32, base_h - 64), base_h + 97, 32):
+            if w * h > max_pixels or max(w, h) > long_cap:
+                continue
+            err = abs((w / h) - aspect)
+            key = (err, -(w * h))
+            if best is None or key < best[0]:
+                best = (key, w, h)
+    if best is None:
+        side = 512 if mode == "fast" else 768
+        return side, side
+    return best[1], best[2]
+
+
+def _open_rgb(path: Path) -> Any:
+    from PIL import Image
+
+    im = Image.open(path)
+    im.load()
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        rgba = im.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return im.convert("RGB")
+
+
+def _fit_h3_still(path: Path, mode: str) -> Any:
+    """Letterbox the still onto the h3 canvas so the first frame is not stretched."""
+    from PIL import Image
+
+    im = _open_rgb(path)
+    canvas_w, canvas_h = _h3_canvas(im.width, im.height, mode)
+    scale = min(canvas_w / im.width, canvas_h / im.height)
+    resized = im.resize(
+        (
+            min(canvas_w, max(1, int(round(im.width * scale)))),
+            min(canvas_h, max(1, int(round(im.height * scale)))),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    canvas.paste(resized, ((canvas_w - resized.width) // 2, (canvas_h - resized.height) // 2))
+    return canvas
+
+
+def _save_poster(im: Any, dest: Path) -> None:
+    from PIL import Image
+
+    thumb = im.copy()
+    thumb.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+    thumb.save(dest, format="PNG", optimize=True)
+
+
+def _h3_command(frame: Path, dest: Path, motion: str, duration: int, width: int, height: int) -> list[str]:
+    binary, model = _h3_paths()
+    cmd = [
+        str(binary),
+        "-d", str(model),
+        "-p", motion,
+        "--width", str(width),
+        "--height", str(height),
+        "--seconds", str(int(duration)),
+        "--steps", str(_h3_steps()),
+        "--layers", str(_h3_layers()),
+        "--reuse", "1",
+        "--first-frame", str(frame),
+        "-o", str(dest),
+    ]
+    if _h3_ssd():
+        cmd.append("--ssd-streaming")
+    return cmd
+
+
+def _h3_failure_message(lines: list[str], code: int | None) -> str:
+    errors = []
+    for line in lines:
+        text = line.strip()
+        if text.lower().startswith("h3:") and "wrote " not in text.lower():
+            errors.append(text)
+    if errors:
+        return errors[-1][:500]
+    tail = " ".join(line.strip() for line in lines[-8:] if line.strip())
+    return (tail or f"local h3 exited {code}")[:500]
+
+
+_H3_PROGRESS_RE = re.compile(r"([A-Za-z][\w .+-]{0,40}?)\s+(\d+)\s*/\s*(\d+)\s*$")
+
+
+async def _read_h3_stream(stream: Any, on_text) -> None:
+    buf = ""
+    while True:
+        chunk = await stream.read(512)
+        if not chunk:
+            if buf.strip():
+                on_text(buf)
+            return
+        buf += chunk.decode("utf-8", "replace")
+        parts = re.split(r"[\r\n]", buf)
+        buf = parts[-1]
+        for part in parts[:-1]:
+            if part.strip():
+                on_text(part)
+
+
+def _stop_h3(proc: asyncio.subprocess.Process, sig: int = signal.SIGTERM) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        # Only signal the child's session. killpg on our own group would stop the portal.
+        if os.getpgid(proc.pid) != os.getpgrp():
+            os.killpg(proc.pid, sig)
+            return
+    except ProcessLookupError:
+        return
+    except Exception:
+        pass
+    try:
+        proc.send_signal(sig)
+    except ProcessLookupError:
+        return
+
+
+async def _finish_pump(pump: asyncio.Future) -> None:
+    """Drain h3's stdout/stderr task and always retrieve its result."""
+    if not pump.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(pump), timeout=1)
+            return
+        except asyncio.TimeoutError:
+            pump.cancel()
+        except Exception:
+            return
+    try:
+        await pump
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _halt_h3(proc: asyncio.subprocess.Process, pump: asyncio.Future) -> None:
+    _stop_h3(proc)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        _stop_h3(proc, signal.SIGKILL)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None and not stream.at_eof():
+                stream.feed_eof()
+        except Exception:
+            pass
+    await _finish_pump(pump)
+
+
+@app.post("/api/animate")
+async def api_animate(body: AnimateBody, _: None = Depends(_check_pin)) -> dict:
+    ready, detail = _h3_ready()
+    if not ready:
+        raise HTTPException(400, detail)
+    duration = int(body.duration)
+    if duration < H3_DURATION_MIN or duration > H3_DURATION_MAX:
+        raise HTTPException(400, f"duration must be {H3_DURATION_MIN}–{H3_DURATION_MAX} seconds")
+    resolution = (body.resolution or "fast").strip().lower()
+    if resolution not in H3_RESOLUTIONS:
+        raise HTTPException(400, "resolution must be fast or 768p")
+    safe = _safe_upload_id(body.image_id)
+    src = UPLOADS / f"{safe}.png"
+    if not safe or not src.exists():
+        raise HTTPException(400, "upload not found — drop the image again")
+
+    user_prompt = (body.prompt or "").strip()
+    motion = user_prompt or H3_DEFAULT_MOTION
+    if len(motion) > 7000:
+        raise HTTPException(400, "motion prompt is too long (max 7000 characters)")
+
+    if user_prompt:
+        try:
+            _history_add(user_prompt, "", width=None, height=None)
+        except Exception:
+            pass
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "id": job_id,
+        "kind": "video",
+        "model": "h3-local",
+        "status": "queued",
+        "provider_status": "queued",
+        "user_prompt": user_prompt,
+        "prompt": motion,
+        "image_id": safe,
+        "duration": duration,
+        "resolution": resolution,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "error": None,
+        "elapsed_s": None,
+        "image": None,
+        "video": None,
+        "pct": 0,
+        "step": 0,
+    }
+    _write_job(job_id, job)
+    asyncio.create_task(_run_animate(job_id, src, motion, duration, resolution))
+    return job
+
+
+async def _run_animate(
+    job_id: str,
+    src: Path,
+    motion: str,
+    duration: int,
+    resolution: str,
+) -> None:
+    t0 = time.time()
+    job = json.loads(_job_path(job_id).read_text())
+    frame_path = PROGRESS / f"{job_id}-first.png"
+    dest = VIDEOS / f"{job_id}.mp4"
+
+    def _touch(**fields: Any) -> None:
+        job.update(fields)
+        job["updated_at"] = time.time()
+        job["elapsed_s"] = round(time.time() - t0, 2)
+        _write_job(job_id, job)
+
+    def _cancelled() -> bool:
+        if (PROGRESS / f"{job_id}.cancel").exists():
+            return True
+        try:
+            current = json.loads(_job_path(job_id).read_text())
+        except Exception:
+            return False
+        return current.get("status") == "cancelled"
+
+    proc: asyncio.subprocess.Process | None = None
+    pump: asyncio.Future | None = None
+    try:
+        if _cancelled():
+            _touch(status="cancelled", error=None, pct=0)
+            return
+        prepared = _fit_h3_still(src, resolution)
+        prepared.save(frame_path, format="PNG")
+        _touch(
+            width=prepared.width,
+            height=prepared.height,
+            status="running",
+            provider_status="starting",
+            pct=1,
+            layers=_h3_layers(),
+            steps=_h3_steps(),
+        )
+        cmd = _h3_command(frame_path, dest, motion, duration, prepared.width, prepared.height)
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            ),
+            timeout=30,
+        )
+        notes: list[str] = []
+
+        def on_text(text: str) -> None:
+            line = text.strip()
+            if not line:
+                return
+            notes.append(line)
+            del notes[:-40]
+            match = _H3_PROGRESS_RE.search(line)
+            if not match:
+                return
+            phase = match.group(1).strip()
+            done = int(match.group(2))
+            total = max(1, int(match.group(3)))
+            _touch(
+                status="running",
+                provider_status=f"{phase} {done}/{total}",
+                pct=min(99, int(100 * done / total)),
+                step=done,
+                steps=total,
+            )
+
+        assert proc.stdout is not None and proc.stderr is not None
+        # gather() is already a Future. create_task() rejects that on Python 3.11+.
+        pump = asyncio.gather(
+            _read_h3_stream(proc.stderr, on_text),
+            _read_h3_stream(proc.stdout, on_text),
+        )
+        deadline = time.time() + 6 * 3600
+        while True:
+            if _cancelled():
+                await _halt_h3(proc, pump)
+                pump = None
+                _touch(status="cancelled", error=None, pct=0)
+                return
+            if time.time() > deadline:
+                await _halt_h3(proc, pump)
+                pump = None
+                raise RuntimeError("local h3 timed out after 6 hours")
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.4)
+                break
+            except asyncio.TimeoutError:
+                continue
+        await pump
+        pump = None
+        if _cancelled():
+            _touch(status="cancelled", error=None, pct=0)
+            return
+        if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+            raise RuntimeError(_h3_failure_message(notes, proc.returncode))
+        poster = IMAGES / f"{job_id}.png"
+        _save_poster(prepared, poster)
+        _touch(
+            status="done",
+            provider_status="done",
+            error=None,
+            pct=100,
+            image=f"/api/images/{job_id}.png",
+            video=f"/api/videos/{job_id}.mp4",
+            elapsed_s=round(time.time() - t0, 2),
+        )
+    except HTTPException as e:
+        _touch(status="error", error=str(e.detail), pct=0)
+    except Exception as e:
+        _touch(status="error", error=str(e), pct=0)
+    finally:
+        if proc is not None and proc.returncode is None:
+            _stop_h3(proc)
+        if pump is not None:
+            await _finish_pump(pump)
+        try:
+            frame_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            (PROGRESS / f"{job_id}.cancel").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.get("/api/videos/{name}")
+def api_video(name: str, _: None = Depends(_check_pin)) -> FileResponse:
+    if not name.endswith(".mp4") or "/" in name or ".." in name:
+        raise HTTPException(400, "bad name")
+    path = VIDEOS / name
+    if not path.exists():
+        raise HTTPException(404, "missing")
+    return FileResponse(path, media_type="video/mp4")
+
 
 @app.post("/api/generate")
 async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dict:
@@ -724,6 +1239,13 @@ def api_clear_all(_: None = Depends(_check_pin)) -> dict:
             cleared["images"] += 1
         except Exception:
             pass
+    cleared["videos"] = 0
+    for p in VIDEOS.glob("*.mp4"):
+        try:
+            p.unlink()
+            cleared["videos"] += 1
+        except Exception:
+            pass
     # Jobs
     for p in JOBS.glob("*.json"):
         try:
@@ -772,36 +1294,53 @@ def api_gallery(_: None = Depends(_check_pin)) -> dict:
             j = json.loads(p.read_text())
         except Exception:
             continue
-        if j.get("status") == "done" and (IMAGES / f"{j['id']}.png").exists():
-            user_prompt = _strip_frame(j.get("user_prompt") or j.get("prompt") or "")
-            items.append(
-                {
-                    "id": j["id"],
-                    "prompt": user_prompt or j.get("prompt"),
-                    "user_prompt": user_prompt or j.get("prompt"),
-                    "negative_prompt": j.get("negative_prompt") or "",
-                    "spicy": bool(j.get("spicy")),
-                    "nsfw": _is_nsfw(j),
-                    "starred": bool(j.get("starred")),
-                    "rgba": bool(j.get("rgba")),
-                    "image": f"/api/images/{j['id']}.png",
-                    "width": j.get("width"),
-                    "height": j.get("height"),
-                    "seed": j.get("seed"),
-                    "steps": j.get("steps"),
-                    "created_at": j.get("created_at"),
-                    "elapsed_s": j.get("elapsed_s"),
-                }
-            )
+        is_video = _job_kind(j) == "video"
+        poster = IMAGES / f"{j['id']}.png"
+        video_path = VIDEOS / f"{j['id']}.mp4"
+        if j.get("status") != "done":
+            continue
+        if is_video and not video_path.exists():
+            continue
+        if not is_video and not poster.exists():
+            continue
+        user_prompt = _strip_frame(j.get("user_prompt") or j.get("prompt") or "")
+        items.append(
+            {
+                "id": j["id"],
+                "kind": "video" if is_video else "image",
+                "prompt": user_prompt or j.get("prompt"),
+                "user_prompt": user_prompt or j.get("prompt"),
+                "negative_prompt": j.get("negative_prompt") or "",
+                "spicy": bool(j.get("spicy")),
+                "nsfw": _is_nsfw(j),
+                "starred": bool(j.get("starred")),
+                "rgba": bool(j.get("rgba")),
+                "image": f"/api/images/{j['id']}.png" if poster.exists() else None,
+                "video": f"/api/videos/{j['id']}.mp4" if is_video else None,
+                "duration": j.get("duration"),
+                "resolution": j.get("resolution"),
+                "model": j.get("model"),
+                "width": j.get("width"),
+                "height": j.get("height"),
+                "seed": j.get("seed"),
+                "steps": j.get("steps"),
+                "created_at": j.get("created_at"),
+                "elapsed_s": j.get("elapsed_s"),
+                "image_id": j.get("image_id"),
+            }
+        )
     return {"items": items}
 
 
 @app.delete("/api/gallery/{job_id}")
 def api_gallery_delete(job_id: str, _: None = Depends(_check_pin)) -> dict:
     img = IMAGES / f"{job_id}.png"
+    vid = VIDEOS / f"{job_id}.mp4"
     job = _job_path(job_id)
     if img.exists():
         img.unlink()
+    if vid.exists():
+        vid.unlink()
     if job.exists():
         job.unlink()
     return {"ok": True, "id": job_id}
@@ -855,9 +1394,12 @@ async def api_gallery_delete_batch(request: Request, _: None = Depends(_check_pi
         if not safe:
             continue
         img = IMAGES / f"{safe}.png"
+        vid = VIDEOS / f"{safe}.mp4"
         jobp = _job_path(safe)
         if img.exists():
             img.unlink()
+        if vid.exists():
+            vid.unlink()
         if jobp.exists():
             jobp.unlink()
         deleted.append(safe)
@@ -868,7 +1410,28 @@ async def api_gallery_delete_batch(request: Request, _: None = Depends(_check_pi
 def healthz() -> dict:
     return {"ok": True}
 
+def _fail_orphaned_video_jobs() -> None:
+    """A restart kills the local h3 process. Mark in-flight clips as interrupted."""
+    for p in JOBS.glob("*.json"):
+        try:
+            job = json.loads(p.read_text())
+        except Exception:
+            continue
+        if _job_kind(job) != "video":
+            continue
+        if job.get("status") not in ("queued", "running"):
+            continue
+        job["status"] = "error"
+        job["error"] = "interrupted — the portal restarted before local h3 finished"
+        job["updated_at"] = time.time()
+        _write_job(str(job.get("id") or p.stem), job)
+
+
 try:
     _seed_history_from_jobs()
+except Exception:
+    pass
+try:
+    _fail_orphaned_video_jobs()
 except Exception:
     pass
