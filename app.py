@@ -4,11 +4,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 import os
+import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -27,13 +28,19 @@ JOBS = DATA / "jobs"
 PROGRESS = DATA / "progress"
 UPLOADS = DATA / "uploads"
 VIDEOS = DATA / "videos"
+THUMBS = DATA / "thumbs"
 STATIC = ROOT / "static"
 IMAGES.mkdir(parents=True, exist_ok=True)
 JOBS.mkdir(parents=True, exist_ok=True)
 PROGRESS.mkdir(parents=True, exist_ok=True)
 UPLOADS.mkdir(parents=True, exist_ok=True)
 VIDEOS.mkdir(parents=True, exist_ok=True)
+THUMBS.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA / "prompt_history.json"
+# Grid cells are ~200–400 CSS px. 512px JPEG covers a phone retina without
+# shipping the full 1280px PNG for every tile.
+THUMB_PX = 512
+_MEDIA_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
 
 
 def _load_dotenv(path: Path) -> None:
@@ -163,11 +170,49 @@ def _job_path(job_id: str) -> Path:
     return JOBS / f"{job_id}.json"
 
 
+def _safe_media_id(job_id: str) -> str:
+    return "".join(c for c in str(job_id) if c.isalnum())[:24]
+
+
+_gallery_lock = threading.Lock()
+_gallery_cache: list[dict] | None = None
+_gallery_token: tuple | None = None
+_gallery_gen = 0
+_thumb_locks: dict[str, threading.Lock] = {}
+_thumb_locks_guard = threading.Lock()
+
+
+def _dir_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _gallery_token_now() -> tuple:
+    return (
+        _gallery_gen,
+        _dir_mtime_ns(JOBS),
+        _dir_mtime_ns(IMAGES),
+        _dir_mtime_ns(VIDEOS),
+    )
+
+
+def _bump_gallery() -> None:
+    """Drop the in-memory gallery list. The next read rebuilds it from disk."""
+    global _gallery_gen, _gallery_cache, _gallery_token
+    with _gallery_lock:
+        _gallery_gen += 1
+        _gallery_cache = None
+        _gallery_token = None
+
+
 def _write_job(job_id: str, data: dict) -> None:
     p = _job_path(job_id)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(p)
+    _bump_gallery()
 
 
 
@@ -436,6 +481,122 @@ def _meminfo() -> dict:
     return out
 
 
+# (monotonic time, rx bytes, tx bytes) from the previous status sample.
+_net_prev: tuple[float, int, int] | None = None
+
+
+def _physical_iface(name: str) -> bool:
+    """Real NICs only, so docker veth and loopback are not counted twice."""
+    n = name.strip().rstrip("*")
+    return n.startswith(("en", "eth", "wl", "wlan", "bond", "ib"))
+
+
+def _parse_proc_net_dev(text: str) -> list[tuple[str, int, int]]:
+    """(iface, rx bytes, tx bytes) from /proc/net/dev."""
+    rows: list[tuple[str, int, int]] = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        name, rest = line.split(":", 1)
+        cols = rest.split()
+        if len(cols) < 9:
+            continue
+        try:
+            rows.append((name.strip(), int(cols[0]), int(cols[8])))
+        except ValueError:
+            continue
+    return rows
+
+
+def _parse_netstat_ib(text: str) -> list[tuple[str, int, int]]:
+    """Link-layer rows from `netstat -ibn` (macOS). Ibytes/Obytes counted from the right."""
+    rows: list[tuple[str, int, int]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if "<Link" not in line:
+            continue
+        cols = line.split()
+        if len(cols) < 8:
+            continue
+        name = cols[0].rstrip("*")
+        if name in seen:
+            continue
+        try:
+            rx = int(cols[-5])
+            tx = int(cols[-2])
+        except ValueError:
+            continue
+        seen.add(name)
+        rows.append((name, rx, tx))
+    return rows
+
+
+def _select_net_rows(rows: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
+    phys = [row for row in rows if _physical_iface(row[0])]
+    if phys:
+        return phys
+    return [row for row in rows if row[0] not in ("lo", "lo0")]
+
+
+def _read_net_rows() -> list[tuple[str, int, int]] | None:
+    proc = Path("/proc/net/dev")
+    try:
+        if proc.exists():
+            return _parse_proc_net_dev(proc.read_text())
+    except Exception:
+        return None
+    try:
+        result = subprocess.run(
+            ["netstat", "-ibn"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return None
+        return _parse_netstat_ib(result.stdout or "")
+    except Exception:
+        return None
+
+
+def _net_bandwidth() -> dict:
+    """Receive/transmit bytes per second since the previous /api/status sample.
+
+    The first call returns null rates; the footer fills in on the next poll.
+    """
+    empty: dict[str, Any] = {"rx_bps": None, "tx_bps": None, "ifaces": []}
+    global _net_prev
+    try:
+        rows = _read_net_rows()
+        if not rows:
+            return empty
+        chosen = _select_net_rows(rows)
+        if not chosen:
+            return empty
+        rx = sum(r for _, r, _ in chosen)
+        tx = sum(t for _, _, t in chosen)
+        active = [name for name, r, t in chosen if r + t > 0]
+        ifaces = active or [name for name, _, _ in chosen]
+        now = time.monotonic()
+        prev = _net_prev
+        _net_prev = (now, rx, tx)
+        if prev is None:
+            return {"rx_bps": None, "tx_bps": None, "ifaces": ifaces}
+        t0, rx0, tx0 = prev
+        dt = now - t0
+        if dt <= 0:
+            return {"rx_bps": None, "tx_bps": None, "ifaces": ifaces}
+        drx = rx - rx0 if rx >= rx0 else rx
+        dtx = tx - tx0 if tx >= tx0 else tx
+        return {
+            "rx_bps": round(drx / dt, 1),
+            "tx_bps": round(dtx / dt, 1),
+            "ifaces": ifaces,
+        }
+    except Exception:
+        return empty
+
+
 def _docker_running(name: str) -> Optional[bool]:
     try:
         r = subprocess.run(
@@ -544,6 +705,7 @@ async def status(request: Request) -> dict:
         "gpu_percent": _gpu_percent(),
         "gpu_temp_c": _gpu_temp_c(),
         "cpu_temp_c": _cpu_temp_c(),
+        "net": _net_bandwidth(),
         "pin_ok": request.cookies.get(COOKIE) == PIN
         or request.headers.get("X-Imagine-Pin") == PIN,
     }
@@ -1005,6 +1167,10 @@ async def _run_animate(
             raise RuntimeError(_h3_failure_message(notes, proc.returncode))
         poster = IMAGES / f"{job_id}.png"
         _save_poster(prepared, poster)
+        try:
+            _write_grid_thumb(poster, THUMBS / _thumb_name(job_id, False), False)
+        except Exception:
+            pass
         _touch(
             status="done",
             provider_status="done",
@@ -1169,6 +1335,11 @@ async def _run_generate(job_id: str, payload: dict, fallback_seed: Optional[int]
         if src.resolve() != dest.resolve():
             if src.exists():
                 shutil.copy2(src, dest)
+        try:
+            rgba = bool(job.get("rgba"))
+            _write_grid_thumb(dest, THUMBS / _thumb_name(job_id, rgba), rgba)
+        except Exception:
+            pass
         job.update(
             {
                 "status": "done",
@@ -1260,6 +1431,16 @@ def api_clear_all(_: None = Depends(_check_pin)) -> dict:
             cleared["progress"] += 1
         except Exception:
             pass
+    cleared["thumbs"] = 0
+    for p in THUMBS.glob("*"):
+        if p.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            continue
+        try:
+            p.unlink()
+            cleared["thumbs"] += 1
+        except Exception:
+            pass
+    _bump_gallery()
     return {"ok": True, "cleared": cleared}
 
 
@@ -1286,64 +1467,172 @@ def _is_nsfw(job: dict) -> bool:
     )
     return bool(_NSFW_RE.search(text))
 
-@app.get("/api/gallery")
-def api_gallery(_: None = Depends(_check_pin)) -> dict:
-    items = []
-    for p in sorted(JOBS.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+
+def _thumb_name(job_id: str, rgba: bool) -> str:
+    return f"{job_id}.png" if rgba else f"{job_id}.jpg"
+
+
+def _thumb_lock(name: str) -> threading.Lock:
+    with _thumb_locks_guard:
+        lock = _thumb_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _thumb_locks[name] = lock
+        return lock
+
+
+def _write_grid_thumb(src: Path, dest: Path, rgba: bool) -> None:
+    """Write a small grid thumbnail. Safe to call from several requests at once."""
+    from PIL import Image
+
+    lock = _thumb_lock(dest.name)
+    with lock:
+        if dest.exists() and dest.stat().st_size > 0:
+            return
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        try:
+            with Image.open(src) as im:
+                im.load()
+                im.thumbnail((THUMB_PX, THUMB_PX), Image.Resampling.BILINEAR)
+                if rgba:
+                    frame = im.convert("RGBA")
+                elif im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    rgba_im = im.convert("RGBA")
+                    frame = Image.new("RGB", rgba_im.size, (0, 0, 0))
+                    frame.paste(rgba_im, mask=rgba_im.split()[-1])
+                else:
+                    frame = im.convert("RGB")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if rgba:
+                    frame.save(tmp, format="PNG", compress_level=3)
+                else:
+                    frame.save(tmp, format="JPEG", quality=76)
+            tmp.replace(dest)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+
+def _delete_gallery_id(job_id: str) -> str:
+    safe = _safe_media_id(job_id)
+    if not safe:
+        return ""
+    for path in (
+        IMAGES / f"{safe}.png",
+        VIDEOS / f"{safe}.mp4",
+        _job_path(safe),
+        THUMBS / f"{safe}.jpg",
+        THUMBS / f"{safe}.png",
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return safe
+
+
+def _build_gallery_items() -> list[dict]:
+    rows: list[tuple[float, dict]] = []
+    for p in JOBS.glob("*.json"):
         try:
             j = json.loads(p.read_text())
         except Exception:
             continue
-        is_video = _job_kind(j) == "video"
-        poster = IMAGES / f"{j['id']}.png"
-        video_path = VIDEOS / f"{j['id']}.mp4"
-        if j.get("status") != "done":
+        if j.get("status") != "done" or not j.get("id"):
             continue
+        is_video = _job_kind(j) == "video"
+        job_id = str(j["id"])
+        poster = IMAGES / f"{job_id}.png"
+        video_path = VIDEOS / f"{job_id}.mp4"
         if is_video and not video_path.exists():
             continue
         if not is_video and not poster.exists():
             continue
+        rgba = bool(j.get("rgba"))
         user_prompt = _strip_frame(j.get("user_prompt") or j.get("prompt") or "")
-        items.append(
-            {
-                "id": j["id"],
-                "kind": "video" if is_video else "image",
-                "prompt": user_prompt or j.get("prompt"),
-                "user_prompt": user_prompt or j.get("prompt"),
-                "negative_prompt": j.get("negative_prompt") or "",
-                "spicy": bool(j.get("spicy")),
-                "nsfw": _is_nsfw(j),
-                "starred": bool(j.get("starred")),
-                "rgba": bool(j.get("rgba")),
-                "image": f"/api/images/{j['id']}.png" if poster.exists() else None,
-                "video": f"/api/videos/{j['id']}.mp4" if is_video else None,
-                "duration": j.get("duration"),
-                "resolution": j.get("resolution"),
-                "model": j.get("model"),
-                "width": j.get("width"),
-                "height": j.get("height"),
-                "seed": j.get("seed"),
-                "steps": j.get("steps"),
-                "created_at": j.get("created_at"),
-                "elapsed_s": j.get("elapsed_s"),
-                "image_id": j.get("image_id"),
-            }
+        rows.append(
+            (
+                float(j.get("created_at") or 0),
+                {
+                    "id": job_id,
+                    "kind": "video" if is_video else "image",
+                    "prompt": user_prompt or j.get("prompt"),
+                    "user_prompt": user_prompt or j.get("prompt"),
+                    "negative_prompt": j.get("negative_prompt") or "",
+                    "spicy": bool(j.get("spicy")),
+                    "nsfw": _is_nsfw(j),
+                    "starred": bool(j.get("starred")),
+                    "rgba": rgba,
+                    "image": f"/api/images/{job_id}.png" if poster.exists() else None,
+                    "thumb": f"/api/thumbs/{_thumb_name(job_id, rgba)}" if poster.exists() else None,
+                    "video": f"/api/videos/{job_id}.mp4" if is_video else None,
+                    "duration": j.get("duration"),
+                    "resolution": j.get("resolution"),
+                    "model": j.get("model"),
+                    "width": j.get("width"),
+                    "height": j.get("height"),
+                    "seed": j.get("seed"),
+                    "steps": j.get("steps"),
+                    "created_at": j.get("created_at"),
+                    "elapsed_s": j.get("elapsed_s"),
+                    "image_id": j.get("image_id"),
+                },
+            )
         )
-    return {"items": items}
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [item for _, item in rows]
+
+
+def _gallery_items() -> list[dict]:
+    global _gallery_cache, _gallery_token
+    token = _gallery_token_now()
+    with _gallery_lock:
+        if _gallery_cache is not None and _gallery_token == token:
+            return _gallery_cache
+    items = _build_gallery_items()
+    with _gallery_lock:
+        if _gallery_token_now() == token:
+            _gallery_cache = items
+            _gallery_token = token
+    return items
+
+
+def _warm_gallery_thumbs() -> None:
+    """Fill missing grid thumbs one at a time so the first scroll is not a decode storm."""
+    try:
+        items = _gallery_items()
+    except Exception:
+        return
+    for it in items:
+        thumb = str(it.get("thumb") or "")
+        name = thumb.rsplit("/", 1)[-1]
+        if not name or "/" in name or ".." in name:
+            continue
+        dest = THUMBS / name
+        if dest.exists() and dest.stat().st_size > 0:
+            continue
+        src = IMAGES / f"{it['id']}.png"
+        if not src.exists():
+            continue
+        try:
+            _write_grid_thumb(src, dest, rgba=name.endswith(".png"))
+        except Exception:
+            continue
+
+
+@app.get("/api/gallery")
+def api_gallery(_: None = Depends(_check_pin)) -> dict:
+    return {"items": _gallery_items()}
 
 
 @app.delete("/api/gallery/{job_id}")
 def api_gallery_delete(job_id: str, _: None = Depends(_check_pin)) -> dict:
-    img = IMAGES / f"{job_id}.png"
-    vid = VIDEOS / f"{job_id}.mp4"
-    job = _job_path(job_id)
-    if img.exists():
-        img.unlink()
-    if vid.exists():
-        vid.unlink()
-    if job.exists():
-        job.unlink()
-    return {"ok": True, "id": job_id}
+    safe = _delete_gallery_id(job_id)
+    _bump_gallery()
+    return {"ok": True, "id": safe or job_id}
 
 
 @app.get("/api/images/{name}")
@@ -1353,7 +1642,27 @@ def api_image(name: str, _: None = Depends(_check_pin)) -> FileResponse:
     path = IMAGES / name
     if not path.exists():
         raise HTTPException(404, "missing")
-    return FileResponse(path, media_type="image/png")
+    return FileResponse(path, media_type="image/png", headers=_MEDIA_CACHE)
+
+
+@app.get("/api/thumbs/{name}")
+def api_thumb(name: str, _: None = Depends(_check_pin)) -> FileResponse:
+    if "/" in name or ".." in name or not (name.endswith(".jpg") or name.endswith(".png")):
+        raise HTTPException(400, "bad name")
+    job_id = name.rsplit(".", 1)[0]
+    if not job_id.isalnum() or len(job_id) > 24:
+        raise HTTPException(400, "bad name")
+    path = THUMBS / name
+    if not path.exists() or path.stat().st_size == 0:
+        src = IMAGES / f"{job_id}.png"
+        if not src.exists():
+            raise HTTPException(404, "missing")
+        try:
+            _write_grid_thumb(src, path, rgba=name.endswith(".png"))
+        except Exception:
+            raise HTTPException(404, "missing")
+    media = "image/png" if name.endswith(".png") else "image/jpeg"
+    return FileResponse(path, media_type=media, headers=_MEDIA_CACHE)
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -1390,19 +1699,10 @@ async def api_gallery_delete_batch(request: Request, _: None = Depends(_check_pi
     ids = body.get("ids") or []
     deleted = []
     for job_id in ids:
-        safe = "".join(c for c in str(job_id) if c.isalnum())[:24]
-        if not safe:
-            continue
-        img = IMAGES / f"{safe}.png"
-        vid = VIDEOS / f"{safe}.mp4"
-        jobp = _job_path(safe)
-        if img.exists():
-            img.unlink()
-        if vid.exists():
-            vid.unlink()
-        if jobp.exists():
-            jobp.unlink()
-        deleted.append(safe)
+        safe = _delete_gallery_id(str(job_id))
+        if safe:
+            deleted.append(safe)
+    _bump_gallery()
     return {"ok": True, "deleted": deleted}
 
 
@@ -1435,3 +1735,6 @@ try:
     _fail_orphaned_video_jobs()
 except Exception:
     pass
+
+if os.environ.get("IMAGINE_THUMB_WARM", "1") != "0":
+    threading.Thread(target=_warm_gallery_thumbs, name="imagine-thumbs", daemon=True).start()

@@ -166,6 +166,41 @@ textarea { min-height: 96px; resize: vertical; line-height: 1.4; }
   object-fit: cover;
   object-position: center;
   display: block;
+  opacity: 0;
+  transition: opacity 0.18s linear;
+}
+.gitem img.ready { opacity: 1; }
+.gitem.deleting { pointer-events: none; }
+.gitem.deleting img { opacity: 0.28 !important; }
+.gitem .del-state {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 650;
+}
+.del-spin {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  animation: del-spin 0.7s linear infinite;
+}
+@keyframes del-spin { to { transform: rotate(360deg); } }
+.gitem.deleting-out { animation: gitem-out 0.18s ease forwards; }
+@keyframes gitem-out {
+  to { opacity: 0; transform: scale(0.94); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gitem img, .gitem.deleting-out, .del-spin { animation: none; transition: none; }
 }
 .gitem button.del {
   position: absolute;
@@ -364,7 +399,7 @@ input[type="file"] {
 .gitem.nsfw img {
   filter: blur(18px);
   transform: scale(1.08); /* hide soft edges from blur */
-  transition: filter .18s ease, transform .18s ease;
+  transition: filter .18s ease, transform .18s ease, opacity .18s linear;
 }
 .gitem.nsfw::after {
   content: "NSFW";
@@ -602,16 +637,13 @@ input[type="file"] {
 }
 .status-footer #statusPill {
   pointer-events: auto;
-  max-width: min(420px, calc(100vw - 20px));
+  max-width: min(640px, calc(100vw - 20px));
   width: auto;
   text-align: right;
   font-size: 11px;
-  line-height: 1.3;
+  line-height: 1.35;
   padding: 5px 10px;
   border-radius: 999px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   background: rgba(7, 7, 11, 0.88);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);

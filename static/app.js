@@ -43,6 +43,10 @@
   let galleryFilter = localStorage.getItem('imagine_gallery_filter') || 'all';
   let selectMode = false;
   let selectedIds = new Set();
+  let deletingIds = new Set();
+  // Ids removed locally. A gallery refresh that started before the delete
+  // returns must not put those cards back.
+  let removedIds = new Set();
   let activeJobId = null;
   let cancelRequested = false;
   let galleryItems = [];
@@ -350,6 +354,35 @@
     }
   }
 
+  function formatBitrate(bytesPerSec) {
+    if (bytesPerSec == null || !Number.isFinite(bytesPerSec) || bytesPerSec < 0) return "";
+    const bits = bytesPerSec * 8;
+    const units = [
+      [1e9, "Gb/s"],
+      [1e6, "Mb/s"],
+      [1e3, "kb/s"],
+    ];
+    for (const [scale, unit] of units) {
+      if (bits >= scale) {
+        const v = bits / scale;
+        const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
+        const text = v.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d)0$/, "$1");
+        return `${text} ${unit}`;
+      }
+    }
+    return `${Math.round(bits)} b/s`;
+  }
+
+  function formatNetTelemetry(net) {
+    if (!net || net.rx_bps == null || net.tx_bps == null) return "";
+    const down = formatBitrate(net.rx_bps);
+    const up = formatBitrate(net.tx_bps);
+    if (!down || !up) return "";
+    const names = Array.isArray(net.ifaces) ? net.ifaces.filter(Boolean) : [];
+    const label = names.length === 1 ? `${names[0]} ` : "";
+    return `${label}↓ ${down} ↑ ${up}`;
+  }
+
   async function pollStatus() {
     try {
       const s = await fetch("/api/status", { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.json());
@@ -368,7 +401,8 @@
       const cpuT = s.cpu_temp_c != null ? `CPU ${Math.round(s.cpu_temp_c)}°C` : "";
       // Prefer GPU temp (most meaningful on Spark); fall back to CPU package temp
       const temp = gpuT || cpuT;
-      const load = [cpu, gpu, temp, mem].filter(Boolean).join(" · ");
+      const net = formatNetTelemetry(s.net);
+      const load = [cpu, gpu, temp, mem, net].filter(Boolean).join(" · ");
       if (ready) {
         pill.textContent = load ? `ready · ${load}` : "ready";
         pill.className = "ok";
@@ -382,10 +416,13 @@
         pill.textContent = load ? `worker down · ${load}` : "worker down";
         pill.className = "err";
       }
+      const ifaces = s.net && Array.isArray(s.net.ifaces) ? s.net.ifaces.filter(Boolean) : [];
+      pill.title = ifaces.length > 1 ? `${pill.textContent} (${ifaces.join(", ")})` : pill.textContent;
       if (s.pin_ok) $("gate").classList.add("hidden");
     } catch {
       $("statusPill").textContent = "offline";
       $("statusPill").className = "err";
+      $("statusPill").removeAttribute("title");
     }
   }
 
@@ -472,98 +509,288 @@
     });
   }
 
+  function itemById(id) {
+    return (galleryItems || []).find((x) => x.id === id);
+  }
+
+  function galleryCardEl(id) {
+    const g = $("gallery");
+    if (!g) return null;
+    for (const child of g.children) {
+      if (child.dataset.id === id) return child;
+    }
+    return null;
+  }
+
+  function dropCard(card) {
+    const img = card.querySelector("img");
+    if (img && thumbObserver) thumbObserver.unobserve(img);
+    card.remove();
+  }
+
+  function thumbSrcFor(it) {
+    if (it.thumb) return it.thumb;
+    if (!it.image || !it.id) return "";
+    return `/api/thumbs/${it.id}.${it.rgba ? "png" : "jpg"}`;
+  }
+
+  let thumbObserver = null;
+  function observeThumb(img) {
+    if (!("IntersectionObserver" in window)) {
+      if (img.dataset.src) img.src = img.dataset.src;
+      return;
+    }
+    if (!thumbObserver) {
+      thumbObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const node = entry.target;
+          if (node.dataset.src && node.getAttribute("src") !== node.dataset.src) {
+            node.src = node.dataset.src;
+            if (node.complete && node.naturalWidth) node.classList.add("ready");
+          }
+          thumbObserver.unobserve(node);
+        }
+      }, { rootMargin: "600px 0px" });
+    }
+    thumbObserver.observe(img);
+  }
+
+  function galleryCardClass(it) {
+    return "gitem"
+      + ((it.nsfw || it.spicy) ? " nsfw" : "")
+      + (it.rgba ? " rgba-thumb" : "")
+      + (it.kind === "video" ? " video" : "")
+      + (selectedIds.has(it.id) ? " selected" : "")
+      + (deletingIds.has(it.id) ? " deleting" : "");
+  }
+
+  function syncGalleryCard(card, it) {
+    card.className = galleryCardClass(it);
+    card.setAttribute("aria-busy", deletingIds.has(it.id) ? "true" : "false");
+    const star = card.querySelector("button.star");
+    if (star) {
+      star.classList.toggle("on", !!it.starred);
+      star.textContent = it.starred ? "★" : "☆";
+    }
+    let chk = card.querySelector(".sel-check");
+    if (selectMode) {
+      if (!chk) {
+        chk = document.createElement("div");
+        chk.className = "sel-check";
+        card.appendChild(chk);
+      }
+      chk.textContent = selectedIds.has(it.id) ? "✓" : "";
+    } else if (chk) {
+      chk.remove();
+    }
+    const del = card.querySelector("button.del");
+    if (del) del.classList.toggle("hidden", !!selectMode);
+    let overlay = card.querySelector(".del-state");
+    if (deletingIds.has(it.id)) {
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.className = "del-state";
+        overlay.innerHTML = '<span class="del-spin" aria-hidden="true"></span><span>Deleting…</span>';
+        card.appendChild(overlay);
+      }
+    } else if (overlay) {
+      overlay.remove();
+    }
+  }
+
+  function createGalleryCard(it, eager) {
+    const d = document.createElement("div");
+    d.dataset.id = it.id;
+    const img = document.createElement("img");
+    img.alt = it.prompt || "";
+    img.decoding = "async";
+    if (it.rgba) img.classList.add("checker");
+    const full = it.image || "";
+    if (full) img.dataset.full = full;
+    const thumb = thumbSrcFor(it);
+    if (thumb) img.dataset.src = thumb;
+    img.addEventListener("load", () => img.classList.add("ready"));
+    img.addEventListener("error", () => {
+      const fallback = img.dataset.full;
+      if (fallback && img.dataset.fellback !== "1" && img.getAttribute("src") !== fallback) {
+        img.dataset.fellback = "1";
+        img.src = fallback;
+        return;
+      }
+      img.classList.add("ready");
+    });
+    let pressTimer = null;
+    let longPressed = false;
+    const clearPress = () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      d.classList.remove("pressing");
+    };
+    img.addEventListener("pointerdown", (e) => {
+      if (selectMode || deletingIds.has(d.dataset.id)) return;
+      if (e.button != null && e.button !== 0) return;
+      longPressed = false;
+      d.classList.add("pressing");
+      pressTimer = setTimeout(() => {
+        longPressed = true;
+        clearPress();
+        const current = itemById(d.dataset.id);
+        if (current) usePromptFromJob(current);
+        if (navigator.vibrate) try { navigator.vibrate(12); } catch (_) {}
+      }, 480);
+    });
+    img.addEventListener("pointerup", clearPress);
+    img.addEventListener("pointerleave", clearPress);
+    img.addEventListener("pointercancel", clearPress);
+    img.onclick = (e) => {
+      const current = itemById(d.dataset.id);
+      if (!current || deletingIds.has(current.id)) return;
+      if (selectMode) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (selectedIds.has(current.id)) selectedIds.delete(current.id);
+        else selectedIds.add(current.id);
+        syncGalleryCard(d, current);
+        syncSelectUi();
+        return;
+      }
+      if (longPressed) { e.preventDefault(); e.stopPropagation(); longPressed = false; return; }
+      openSheet(current);
+    };
+    const star = document.createElement("button");
+    star.type = "button";
+    star.className = "star";
+    star.title = "Star";
+    star.onclick = async (e) => {
+      e.stopPropagation();
+      const current = itemById(d.dataset.id);
+      if (!current || deletingIds.has(current.id)) return;
+      try {
+        const res = await api(`/api/gallery/${current.id}/star`, { method: "POST", body: "{}" });
+        current.starred = !!res.starred;
+        syncGalleryCard(d, current);
+        if (sheetJob && sheetJob.id === current.id && $("sheetStar")) {
+          sheetJob.starred = current.starred;
+          $("sheetStar").textContent = current.starred ? "★ Starred" : "★ Star";
+        }
+      } catch (err) {
+        alert("Star failed: " + (err.message || err));
+      }
+    };
+    const del = document.createElement("button");
+    del.className = "del";
+    del.type = "button";
+    del.textContent = "×";
+    del.title = "Delete";
+    del.setAttribute("aria-label", "Delete");
+    del.onclick = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      clearPress();
+      deleteGalleryIds([d.dataset.id]);
+    };
+    d.appendChild(img);
+    d.appendChild(star);
+    if (it.kind === "video") {
+      const badge = document.createElement("div");
+      badge.className = "play-badge";
+      badge.textContent = "▶";
+      d.appendChild(badge);
+    }
+    d.appendChild(del);
+    syncGalleryCard(d, it);
+    if (thumb) {
+      if (eager) {
+        img.src = thumb;
+        if (img.complete && img.naturalWidth) img.classList.add("ready");
+      } else {
+        observeThumb(img);
+      }
+    }
+    return d;
+  }
+
+  async function deleteGalleryIds(ids) {
+    const unique = [];
+    for (const id of ids) {
+      if (id && !deletingIds.has(id) && !unique.includes(id)) unique.push(id);
+    }
+    if (!unique.length) return;
+    const batch = unique.length > 1;
+    const delBtn = $("deleteSelectedBtn");
+    if (batch && delBtn) {
+      delBtn.disabled = true;
+      delBtn.textContent = "Deleting…";
+    }
+    unique.forEach((id) => {
+      deletingIds.add(id);
+      const card = galleryCardEl(id);
+      const it = itemById(id);
+      if (card && it) syncGalleryCard(card, it);
+    });
+    try {
+      if (unique.length === 1) {
+        await api(`/api/gallery/${encodeURIComponent(unique[0])}`, { method: "DELETE" });
+      } else {
+        await api("/api/gallery/delete", { method: "POST", body: JSON.stringify({ ids: unique }) });
+      }
+      const gone = new Set(unique);
+      unique.forEach((id) => removedIds.add(id));
+      galleryItems = galleryItems.filter((it) => !gone.has(it.id));
+      unique.forEach((id) => {
+        deletingIds.delete(id);
+        selectedIds.delete(id);
+        const card = galleryCardEl(id);
+        if (card) card.classList.add("deleting-out");
+      });
+      if (sheetJob && gone.has(sheetJob.id)) closeSheet();
+      window.setTimeout(() => {
+        unique.forEach((id) => {
+          const card = galleryCardEl(id);
+          if (card) dropCard(card);
+        });
+        const empty = $("galleryEmpty");
+        if (empty) empty.classList.toggle("hidden", filteredGalleryItems().length > 0);
+        if (batch) selectMode = false;
+        if (delBtn) delBtn.disabled = false;
+        syncSelectUi();
+      }, 180);
+    } catch (err) {
+      unique.forEach((id) => {
+        deletingIds.delete(id);
+        const card = galleryCardEl(id);
+        const it = itemById(id);
+        if (card && it) syncGalleryCard(card, it);
+      });
+      if (delBtn) delBtn.disabled = false;
+      syncSelectUi();
+      alert("Delete failed: " + (err.message || err));
+    }
+  }
+
   function paintGallery() {
     const g = $("gallery");
     if (!g) return;
-    g.innerHTML = "";
     g.classList.toggle("select-mode", selectMode);
     const items = filteredGalleryItems();
     const empty = $("galleryEmpty");
     if (empty) empty.classList.toggle("hidden", items.length > 0);
-    items.forEach((it) => {
-      const d = document.createElement("div");
-      d.className = "gitem" + (it.nsfw || it.spicy ? " nsfw" : "") + (it.rgba ? " rgba-thumb" : "") + (it.kind === "video" ? " video" : "") + (selectedIds.has(it.id) ? " selected" : "");
-      d.dataset.id = it.id;
-      const img = document.createElement("img");
-      if (it.image) img.src = it.image;
-      img.alt = it.prompt || "";
-      img.loading = "lazy";
-      if (it.rgba) img.classList.add("checker");
-      let pressTimer = null;
-      let longPressed = false;
-      const clearPress = () => {
-        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-        d.classList.remove("pressing");
-      };
-      img.addEventListener("pointerdown", (e) => {
-        if (selectMode) return;
-        if (e.button != null && e.button !== 0) return;
-        longPressed = false;
-        d.classList.add("pressing");
-        pressTimer = setTimeout(() => {
-          longPressed = true;
-          clearPress();
-          usePromptFromJob(it);
-          if (navigator.vibrate) try { navigator.vibrate(12); } catch (_) {}
-        }, 480);
-      });
-      img.addEventListener("pointerup", clearPress);
-      img.addEventListener("pointerleave", clearPress);
-      img.addEventListener("pointercancel", clearPress);
-      img.onclick = (e) => {
-        if (selectMode) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (selectedIds.has(it.id)) selectedIds.delete(it.id);
-          else selectedIds.add(it.id);
-          paintGallery();
-          syncSelectUi();
-          return;
-        }
-        if (longPressed) { e.preventDefault(); e.stopPropagation(); longPressed = false; return; }
-        openSheet(it);
-      };
-      const star = document.createElement("button");
-      star.type = "button";
-      star.className = "star" + (it.starred ? " on" : "");
-      star.textContent = it.starred ? "★" : "☆";
-      star.title = "Star";
-      star.onclick = async (e) => {
-        e.stopPropagation();
-        try {
-          const res = await api(`/api/gallery/${it.id}/star`, { method: "POST", body: "{}" });
-          it.starred = !!res.starred;
-          paintGallery();
-        } catch (err) {
-          alert("Star failed: " + (err.message || err));
-        }
-      };
-      const del = document.createElement("button");
-      del.className = "del";
-      del.type = "button";
-      del.textContent = "×";
-      del.onclick = async (e) => {
-        e.stopPropagation();
-        clearPress();
-        await api(`/api/gallery/${it.id}`, { method: "DELETE" });
-        loadGallery();
-      };
-      if (selectMode) {
-        const chk = document.createElement("div");
-        chk.className = "sel-check";
-        chk.textContent = selectedIds.has(it.id) ? "✓" : "";
-        d.appendChild(chk);
+    const want = new Set(items.map((it) => it.id));
+    for (const child of Array.from(g.children)) {
+      if (!want.has(child.dataset.id)) dropCard(child);
+    }
+    const byId = new Map();
+    for (const child of g.children) byId.set(child.dataset.id, child);
+    items.forEach((it, index) => {
+      let card = byId.get(it.id);
+      if (!card) {
+        card = createGalleryCard(it, index < 12);
+        byId.set(it.id, card);
+      } else {
+        syncGalleryCard(card, it);
       }
-      d.appendChild(img);
-      d.appendChild(star);
-      if (it.kind === "video") {
-        const badge = document.createElement("div");
-        badge.className = "play-badge";
-        badge.textContent = "▶";
-        d.appendChild(badge);
-      }
-      if (!selectMode) d.appendChild(del);
-      g.appendChild(d);
+      const before = g.children[index] || null;
+      if (before !== card) g.insertBefore(card, before);
     });
     applyNsfwBlur();
   }
@@ -581,7 +808,12 @@
   async function loadGallery() {
     try {
       const data = await api("/api/gallery");
-      galleryItems = data.items || [];
+      const incoming = data.items || [];
+      const serverIds = new Set(incoming.map((it) => it.id));
+      for (const id of [...removedIds]) {
+        if (!serverIds.has(id)) removedIds.delete(id);
+      }
+      galleryItems = incoming.filter((it) => !removedIds.has(it.id) && !deletingIds.has(it.id));
       renderGalleryFilters();
       paintGallery();
       syncSelectUi();
@@ -948,13 +1180,12 @@
   if ($("sheetImg")) $("sheetImg").onclick = () => {
     if ($("sheetImg").src) openLightbox($("sheetImg").src);
   };
-  if ($("sheetDelete")) $("sheetDelete").onclick = async () => {
-    if (!sheetJob) return;
+  if ($("sheetDelete")) $("sheetDelete").onclick = () => {
+    if (!sheetJob || deletingIds.has(sheetJob.id)) return;
     if (!confirm("Delete this image?")) return;
     const id = sheetJob.id;
     closeSheet();
-    await api(`/api/gallery/${id}`, { method: "DELETE" });
-    loadGallery();
+    deleteGalleryIds([id]);
   };
 
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSheet(); closeLightbox(); } });
@@ -1175,18 +1406,11 @@
     };
   }
   if ($("deleteSelectedBtn")) {
-    $("deleteSelectedBtn").onclick = async () => {
+    $("deleteSelectedBtn").onclick = () => {
       const ids = Array.from(selectedIds);
       if (!ids.length) return;
-      if (!confirm(`Delete ${ids.length} image(s)?`)) return;
-      try {
-        await api("/api/gallery/delete", { method: "POST", body: JSON.stringify({ ids }) });
-        selectedIds.clear();
-        selectMode = false;
-        await loadGallery();
-      } catch (e) {
-        alert("Delete failed: " + (e.message || e));
-      }
+      if (!confirm(`Delete ${ids.length} image${ids.length === 1 ? "" : "s"}?`)) return;
+      deleteGalleryIds(ids);
     };
   }
   if ($("sheetStar")) {
@@ -1197,8 +1421,11 @@
         sheetJob.starred = !!res.starred;
         $("sheetStar").textContent = sheetJob.starred ? "★ Starred" : "★ Star";
         const gIt = galleryItems.find((x) => x.id === sheetJob.id);
-        if (gIt) gIt.starred = sheetJob.starred;
-        paintGallery();
+        if (gIt) {
+          gIt.starred = sheetJob.starred;
+          const card = galleryCardEl(gIt.id);
+          if (card) syncGalleryCard(card, gIt);
+        }
       } catch (e) {
         alert("Star failed: " + (e.message || e));
       }
