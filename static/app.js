@@ -1097,7 +1097,7 @@
       negative_prompt: $("negative").value.trim(),
       width: aspect.w,
       height: aspect.h,
-      steps: Number($("steps").value) || 28,
+      steps: Number($("steps").value) || 8,
       seed: seedRaw === "" ? null : Number(seedRaw),
       style: style.id || null,
       spicy: !!spicy,

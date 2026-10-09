@@ -116,6 +116,9 @@ STYLE_NEGATIVES = {
         "oil painting, anime cel"
     ),
 }
+# Qwen-Image-2.1-Turbo's saved sample_sigmas grid. The worker reports this
+# count unless the client asks for a different length via explicit sigmas.
+STILL_STEPS = 8
 WORKER_URL = os.environ.get("IMAGINE_WORKER_URL", "http://127.0.0.1:7861")
 COOKIE = "imagine_pin"
 # Local MiniMax H3 via antirez/h3.c (Apple Silicon). Not the cloud API.
@@ -138,7 +141,7 @@ class GenerateBody(BaseModel):
     negative_prompt: Optional[str] = ""
     width: int = 1024
     height: int = 1024
-    steps: int = 28
+    steps: int = STILL_STEPS
     seed: Optional[int] = None
     style: Optional[str] = None
     spicy: bool = False
@@ -1209,9 +1212,8 @@ def api_video(name: str, _: None = Depends(_check_pin)) -> FileResponse:
     return FileResponse(path, media_type="video/mp4")
 
 
-@app.post("/api/generate")
-async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dict:
-    job_id = uuid.uuid4().hex[:12]
+def style_still(body: GenerateBody) -> dict:
+    """Prompt, negatives, and sampling fields for one still. No I/O."""
     user_prompt = body.prompt.strip()
     prompt = user_prompt
     style = (body.style or "").strip()
@@ -1225,7 +1227,8 @@ async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dic
     if rgba and "transparent" not in prompt.lower() and "rgba" not in prompt.lower():
         prompt = RGBA_PREFIX + prompt
     framing = bool(getattr(body, "framing", True))
-    neg = (body.negative_prompt or "").strip()
+    user_negative = (body.negative_prompt or "").strip()
+    neg = user_negative
     # Keep subjects fully framed when Framing is on (default)
     if framing:
         if FRAME_SUFFIX.lower() not in prompt.lower():
@@ -1239,16 +1242,11 @@ async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dic
         for key, neg_extra in STYLE_NEGATIVES.items():
             if key in style_key and neg_extra not in neg:
                 neg = f"{neg}, {neg_extra}".strip(", ").strip()
-
-    # Save clean user prompt to history (not the framing suffix)
-    try:
-        _history_add(user_prompt, body.negative_prompt or "", width=body.width, height=body.height)
-    except Exception:
-        pass
-
-    job = {
-        "id": job_id,
-        "status": "queued",
+    # Turbo's saved schedule is CFG 1. Framing text alone must not lift that.
+    # A negative the user typed, a style's negatives, or spicy mode still bump
+    # CFG so those negatives actually guide.
+    apply_negative_cfg = bool(user_negative) or spicy or bool(style)
+    return {
         "user_prompt": user_prompt,
         "prompt": prompt,
         "negative_prompt": neg,
@@ -1259,8 +1257,66 @@ async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dic
         "strength": float(getattr(body, "strength", 0.65) or 0.65),
         "width": body.width,
         "height": body.height,
-        "steps": body.steps,
+        "steps": int(body.steps),
         "seed": body.seed,
+        "apply_negative_cfg": apply_negative_cfg,
+    }
+
+
+def resolve_edit_path(image_id: Optional[str]) -> Optional[str]:
+    if not image_id:
+        return None
+    safe = "".join(c for c in image_id if c.isalnum())[:24]
+    cand = UPLOADS / f"{safe}.png"
+    if not cand.exists():
+        raise HTTPException(400, "upload not found — re-upload the image")
+    return f"uploads/{safe}.png"
+
+
+def still_worker_payload(body: GenerateBody, job_id: str, image_path: Optional[str] = None) -> dict:
+    """JSON the portal posts to the worker. Uses the same styling as /api/generate."""
+    styled = style_still(body)
+    return {
+        "id": job_id,
+        "prompt": styled["prompt"],
+        "negative_prompt": styled["negative_prompt"],
+        "width": styled["width"],
+        "height": styled["height"],
+        "steps": styled["steps"],
+        "seed": styled["seed"],
+        "rgba": styled["rgba"],
+        "image_path": image_path,
+        "strength": styled["strength"],
+        "apply_negative_cfg": styled["apply_negative_cfg"],
+    }
+
+
+@app.post("/api/generate")
+async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dict:
+    job_id = uuid.uuid4().hex[:12]
+    styled = style_still(body)
+
+    # Save clean user prompt to history (not the framing suffix)
+    try:
+        _history_add(styled["user_prompt"], body.negative_prompt or "", width=body.width, height=body.height)
+    except Exception:
+        pass
+
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "user_prompt": styled["user_prompt"],
+        "prompt": styled["prompt"],
+        "negative_prompt": styled["negative_prompt"],
+        "spicy": styled["spicy"],
+        "rgba": styled["rgba"],
+        "framing": styled["framing"],
+        "image_id": styled["image_id"],
+        "strength": styled["strength"],
+        "width": styled["width"],
+        "height": styled["height"],
+        "steps": styled["steps"],
+        "seed": styled["seed"],
         "created_at": time.time(),
         "updated_at": time.time(),
         "error": None,
@@ -1271,27 +1327,8 @@ async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dic
     }
     _write_job(job_id, job)
 
-    image_path = None
-    image_id = getattr(body, "image_id", None)
-    if image_id:
-        safe = "".join(c for c in image_id if c.isalnum())[:24]
-        cand = UPLOADS / f"{safe}.png"
-        if not cand.exists():
-            raise HTTPException(400, "upload not found — re-upload the image")
-        image_path = f"uploads/{safe}.png"
-
-    payload = {
-        "id": job_id,
-        "prompt": prompt,
-        "negative_prompt": neg,
-        "width": body.width,
-        "height": body.height,
-        "steps": body.steps,
-        "seed": body.seed,
-        "rgba": rgba,
-        "image_path": image_path,
-        "strength": float(getattr(body, "strength", 0.65) or 0.65),
-    }
+    image_path = resolve_edit_path(styled["image_id"])
+    payload = still_worker_payload(body, job_id, image_path)
 
     job["status"] = "running"
     job["updated_at"] = time.time()

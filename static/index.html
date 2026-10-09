@@ -84,7 +84,7 @@
               <div class="seed-steps-row">
                 <div class="seed-steps-col">
                   <label>Steps</label>
-                  <input id="steps" type="number" min="1" max="100" value="28" />
+                  <input id="steps" type="number" min="1" max="100" value="8" />
                 </div>
                 <div class="seed-steps-col seed-col">
                   <label>Seed</label>
@@ -92,6 +92,7 @@
                 </div>
                 <button class="btn btn-ghost btn-icon seed-dice" id="shuffleSeed" type="button" title="Shuffle">🎲</button>
               </div>
+              <p id="turboHint" class="hint">Qwen-Image-2.1-Turbo uses its saved 8-step schedule at CFG 1. A different step count sends an explicit sigma list of that length.</p>
             </div>
           </div>
         </details>
@@ -175,6 +176,6 @@
   </footer>
 
   <div id="dropOverlay" class="drop-overlay hidden">Drop to animate with local H3</div>
-  <script src="/static/app.js?v=92"></script>
+  <script src="/static/app.js?v=93"></script>
 </body>
 </html>

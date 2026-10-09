@@ -32,7 +32,7 @@ One warm Qwen-Image model. One beautiful mobile web UI. Create, edit, cancel, st
   <sub>Mobile compose · Advanced styles &amp; controls</sub>
 </p>
 
-### Sample outputs (Qwen-Image-2.1 on DGX Spark)
+### Sample outputs (Qwen-Image-2.1-Turbo on DGX Spark)
 
 <p align="center">
   <img src="docs/screenshots/sample-koi.jpg" alt="Neon koi in bamboo mist" width="280"/>
@@ -52,7 +52,7 @@ One warm Qwen-Image model. One beautiful mobile web UI. Create, edit, cancel, st
 
 Cloud image apps are fun until the queue, the filter, or the invoice shows up.
 
-**Imagine** is the opposite: a tiny FastAPI portal in front of a *always-warm* Qwen-Image-2.1 worker on your box. Built first for **NVIDIA DGX Spark** and an iPhone in your pocket.
+**Imagine** is the opposite: a tiny FastAPI portal in front of a *always-warm* Qwen-Image-2.1-Turbo worker on your box. Built first for **NVIDIA DGX Spark** and an iPhone in your pocket.
 
 If you want “type a vibe → get a still” on hardware you own, this is that.
 
@@ -69,7 +69,7 @@ If you want “type a vibe → get a still” on hardware you own, this is that.
 | **Framing nudge** | Optional suffix so subjects don’t get cropped at the edges |
 | **Live queue** | Real % / step progress, “#N in queue · ~Xs”, and **Cancel** mid-flight |
 | **Gallery that scales** | Empty state · star · All / Starred / Spicy / Normal filters · multi-select delete · reuse prompt |
-| **Speed path** | Default **28 steps** + optional `torch.compile` on the transformer |
+| **Speed path** | Default **saved 8-step** Turbo schedule (CFG 1, prefix KV cache) + optional `torch.compile` on the transformer |
 | **Phone-first** | Thumb-sized chips, bottom sheet, safe-area padding, self-signed TLS + `/trust` flow |
 
 ---
@@ -79,7 +79,7 @@ If you want “type a vibe → get a still” on hardware you own, this is that.
 ```mermaid
 flowchart LR
   Phone["iPhone / browser"] -->|HTTPS :7860| Portal["Imagine portal<br/>FastAPI + static UI"]
-  Portal -->|POST /generate| Worker["Warm worker<br/>Qwen-Image-2.1"]
+  Portal -->|POST /generate| Worker["Warm worker<br/>Qwen-Image-2.1-Turbo"]
   Worker -->|progress JSON| Portal
   Worker -->|PNG| Disk["data/images"]
   Portal -->|gallery / jobs| Disk
@@ -95,9 +95,9 @@ flowchart LR
 
 ### Requirements
 
-- NVIDIA GPU with enough unified/VRAM for **Qwen-Image-2.1** (~31GB weights; Spark’s 128GB UM is comfortable)
+- NVIDIA GPU with enough unified/VRAM for **Qwen-Image-2.1-Turbo** (~31GB weights; Spark’s 128GB UM is comfortable)
 - Docker (worker) + Python 3.11+ (portal)
-- Weights checked out locally (e.g. Hugging Face `Qwen/Qwen-Image`)
+- Weights checked out locally (Hugging Face `Qwen/Qwen-Image-2.1-Turbo`)
 
 ### 1. Clone
 
@@ -111,7 +111,7 @@ pip install -r requirements.txt
 ### 2. Point at your model + data
 
 ```bash
-export IMAGINE_MODEL=/path/to/Qwen-Image-2.1
+export IMAGINE_MODEL=/path/to/Qwen-Image-2.1-Turbo
 export IMAGINE_DATA="$(pwd)/data"
 export IMAGINE_PIN="choose-a-real-pin"
 mkdir -p "$IMAGINE_DATA"/{images,jobs,progress,uploads}
@@ -176,7 +176,7 @@ Header: `X-Imagine-Pin: <pin>` (or session cookie after `/api/auth`).
 
 ## Stack
 
-- **Model:** [Qwen-Image-2.1](https://huggingface.co/Qwen) via Diffusers
+- **Model:** [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) via Diffusers `QwenImage21Pipeline` (saved 8-step schedule, CFG 1, `use_kv_cache`)
 - **Worker:** FastAPI + CUDA Docker (`torch.compile` optional)
 - **Portal:** FastAPI + vanilla JS (no React tax)
 - **Target:** NVIDIA DGX Spark · also any box that can hold the weights

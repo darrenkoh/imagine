@@ -1,7 +1,11 @@
-"""Warm Qwen-Image-2.1 worker — FastAPI inside the GPU Docker container.
+"""Warm Qwen-Image-2.1-Turbo worker — FastAPI inside the GPU Docker container.
 
 Loads QwenImage21Pipeline once at startup. Portal proxies POST /generate here.
 Writes per-job progress under /data/progress/{id}.json for the portal to poll.
+
+Turbo ships an 8-step `sample_sigmas` grid. A bare `num_inference_steps` does
+not replace that grid, so the default call omits it and reports 8. Any other
+count is sent as an explicit `sigmas` list whose length is the count that runs.
 """
 from __future__ import annotations
 
@@ -16,7 +20,10 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-MODEL_PATH = os.environ.get("IMAGINE_MODEL", "/models/Qwen-Image-2.1")
+CHECKPOINT_ID = "Qwen/Qwen-Image-2.1-Turbo"
+# Length of the checkpoint's saved sample_sigmas grid.
+TURBO_STEPS = 8
+MODEL_PATH = os.environ.get("IMAGINE_MODEL", "/models/Qwen-Image-2.1-Turbo")
 DATA_DIR = Path(os.environ.get("IMAGINE_DATA", "/data"))
 IMAGES_DIR = DATA_DIR / "images"
 PROGRESS_DIR = DATA_DIR / "progress"
@@ -47,7 +54,7 @@ class GenerateRequest(BaseModel):
     negative_prompt: Optional[str] = ""
     width: int = Field(1024, ge=256, le=2048)
     height: int = Field(1024, ge=256, le=2048)
-    steps: int = Field(28, ge=1, le=100)
+    steps: int = Field(TURBO_STEPS, ge=1, le=100)
     seed: Optional[int] = None
     true_cfg_scale: float = Field(1.0, ge=1.0, le=20.0)
     id: Optional[str] = None
@@ -56,6 +63,11 @@ class GenerateRequest(BaseModel):
     rgba: bool = False
     # Edit intensity 0.15–1.0 (prompt-mapped; pipeline has no strength arg)
     strength: float = Field(0.65, ge=0.0, le=1.0)
+    # A negative at CFG 1 does not guide, so the worker raises CFG when this
+    # is set. The portal turns it off for a plain Turbo still (automatic
+    # framing text only) and leaves it on when the user, a style, or spicy
+    # mode actually supplied a negative. Direct API clients keep the bump.
+    apply_negative_cfg: bool = True
 
 
 class CancelledError(Exception):
@@ -102,13 +114,192 @@ def _strength_phrase(strength: float) -> str:
     return "full redesign from the reference, bold transformation"
 
 
+def checkpoint_label(path: Optional[str] = None) -> str:
+    """Health name for the weights directory. Turbo paths use the HF id."""
+    text = MODEL_PATH if path is None else path
+    if "Qwen-Image-2.1-Turbo" in str(text).replace("\\", "/"):
+        return CHECKPOINT_ID
+    return str(text)
+
+
+_state["model"] = checkpoint_label()
+
+
+def explicit_sigmas(steps: int) -> list[float]:
+    """Inclusive linspace the pipeline uses when no saved grid applies.
+
+    Matches QwenImage21Pipeline: np.linspace(1.0, 1/n, n). The terminal sigma
+    is not included; the scheduler appends it.
+    """
+    n = int(steps)
+    if n < 1:
+        raise ValueError("steps must be >= 1")
+    if n == 1:
+        return [1.0]
+    stop = 1.0 / n
+    span = stop - 1.0
+    return [1.0 + span * i / (n - 1) for i in range(n)]
+
+
+def schedule_for_steps(steps: int) -> tuple[dict[str, Any], int]:
+    """Pipeline schedule kwargs, and how many denoising steps that schedule runs.
+
+    The default (8) omits both `sigmas` and `num_inference_steps` so the
+    checkpoint's saved grid runs. `num_inference_steps` alone does not override
+    that grid. Any other count is an explicit sigma list of that length.
+    """
+    n = int(steps)
+    if n == TURBO_STEPS:
+        return {}, TURBO_STEPS
+    sigmas = explicit_sigmas(n)
+    return {"sigmas": sigmas}, len(sigmas)
+
+
+def running_steps(kwargs: dict[str, Any]) -> int:
+    """Steps that will actually denoise, given the kwargs we hand the pipeline.
+
+    An explicit `sigmas` list wins. Otherwise the saved 8-step grid runs.
+    A bare `num_inference_steps` is not an override.
+    """
+    sigmas = kwargs.get("sigmas")
+    if isinstance(sigmas, (list, tuple)) and len(sigmas) > 0:
+        return len(list(sigmas))
+    return TURBO_STEPS
+
+
+class StillCall:
+    """One pipeline call, built with no weights loaded."""
+
+    def __init__(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        steps: int,
+        rgba: bool,
+        edited: bool,
+    ) -> None:
+        self.kwargs = kwargs
+        self.steps = steps
+        self.rgba = rgba
+        self.edited = edited
+
+    @property
+    def output_mode(self) -> str:
+        return "RGBA" if self.rgba else "RGB"
+
+
+def _open_edit_image(req: GenerateRequest, width: int, height: int):
+    from PIL import Image
+
+    rel = (req.image_path or "").lstrip("/")
+    if ".." in rel or rel.startswith("/"):
+        raise HTTPException(400, "bad image_path")
+    src = DATA_DIR / rel
+    if not src.exists() or not src.is_file():
+        raise HTTPException(404, f"image not found: {rel}")
+    pil_image = Image.open(src).convert("RGBA" if req.rgba else "RGB")
+    if not req.width or not req.height:
+        width = max(256, (pil_image.width // 16) * 16)
+        height = max(256, (pil_image.height // 16) * 16)
+    else:
+        pil_image = pil_image.resize((width, height), Image.Resampling.LANCZOS)
+    return pil_image, width, height
+
+
+def prepare_still_call(
+    req: GenerateRequest,
+    *,
+    generator: Any = None,
+    on_step_end: Any = None,
+) -> StillCall:
+    """Map a still request onto QwenImage21Pipeline kwargs. Does not load weights."""
+    width = max(256, (int(req.width) // 16) * 16)
+    height = max(256, (int(req.height) // 16) * 16)
+    prompt = req.prompt
+    if req.rgba:
+        prefix = (
+            "This is an RGBA image with transparency. "
+            "The image has alpha channel and the background is transparent. "
+        )
+        if "rgba" not in prompt.lower() and "transparent" not in prompt.lower():
+            prompt = prefix + prompt
+
+    pil_image = None
+    if req.image_path:
+        pil_image, width, height = _open_edit_image(req, width, height)
+        prompt = f"{prompt}. {_strength_phrase(float(req.strength))}"
+
+    schedule, _schedule_steps = schedule_for_steps(int(req.steps))
+    cfg = float(req.true_cfg_scale)
+    kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "true_cfg_scale": cfg,
+        "use_kv_cache": True,
+    }
+    kwargs.update(schedule)
+    if generator is not None:
+        kwargs["generator"] = generator
+    if pil_image is not None:
+        kwargs["image"] = pil_image
+    if req.negative_prompt:
+        kwargs["negative_prompt"] = req.negative_prompt
+        if req.apply_negative_cfg and cfg <= 1.0:
+            kwargs["true_cfg_scale"] = 4.0
+    if on_step_end is not None:
+        kwargs["callback_on_step_end"] = on_step_end
+    steps = running_steps(kwargs)
+    return StillCall(
+        kwargs=kwargs,
+        steps=steps,
+        rgba=bool(req.rgba),
+        edited=pil_image is not None,
+    )
+
+
+def _require_turbo_runtime() -> None:
+    """Saved Turbo sigmas need pipeline `sample_sigmas` and transformers>=5.17.0."""
+    import inspect
+
+    import transformers
+    from diffusers import QwenImage21Pipeline
+
+    params = inspect.signature(QwenImage21Pipeline.__init__).parameters
+    if "sample_sigmas" not in params:
+        raise RuntimeError(
+            "QwenImage21Pipeline has no sample_sigmas; install Diffusers with "
+            "pipeline-configured sampling sigmas so Qwen-Image-2.1-Turbo loads "
+            "its saved 8-step schedule"
+        )
+    nums: list[int] = []
+    for part in transformers.__version__.split("+", 1)[0].split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        nums.append(int(digits))
+    while len(nums) < 3:
+        nums.append(0)
+    if tuple(nums[:3]) < (5, 17, 0):
+        raise RuntimeError(
+            f"transformers {transformers.__version__} is below 5.17.0, which "
+            "Qwen-Image-2.1-Turbo needs for its text encoder"
+        )
+
+
 def _load_pipeline() -> None:
     global _pipe
     try:
+        _require_turbo_runtime()
         import torch
         from diffusers import QwenImage21Pipeline
 
-        print(f"[worker] loading QwenImage21Pipeline from {MODEL_PATH}", flush=True)
+        print(f"[worker] loading {checkpoint_label()} via QwenImage21Pipeline from {MODEL_PATH}", flush=True)
         t0 = time.time()
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         pipe = QwenImage21Pipeline.from_pretrained(
@@ -165,7 +356,7 @@ def health() -> dict:
         "loading": _state["loading"],
         "ready": _state["ready"],
         "error": _state["error"],
-        "model": _state["model"],
+        "model": checkpoint_label(),
         "uptime_s": round(time.time() - _state["started_at"], 1),
         "ready_at": _state["ready_at"],
         "compiled": bool(_state.get("compiled")),
@@ -203,8 +394,9 @@ def generate(req: GenerateRequest) -> dict:
     import torch
 
     job_id = req.id or uuid.uuid4().hex[:12]
+    steps = schedule_for_steps(int(req.steps))[1]
     if _is_cancelled(job_id):
-        _set_progress(job_id, step=0, steps=int(req.steps), status="cancelled")
+        _set_progress(job_id, step=0, steps=steps, status="cancelled")
         raise HTTPException(409, "cancelled")
 
     seed = (
@@ -213,55 +405,8 @@ def generate(req: GenerateRequest) -> dict:
         else int(torch.randint(0, 2**31 - 1, (1,)).item())
     )
     out_path = IMAGES_DIR / f"{job_id}.png"
-    steps = int(req.steps)
-
-    width = max(256, (req.width // 16) * 16)
-    height = max(256, (req.height // 16) * 16)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     generator = torch.Generator(device=device).manual_seed(int(seed))
-
-    prompt = req.prompt
-    if req.rgba:
-        prefix = (
-            "This is an RGBA image with transparency. "
-            "The image has alpha channel and the background is transparent. "
-        )
-        if "rgba" not in prompt.lower() and "transparent" not in prompt.lower():
-            prompt = prefix + prompt
-
-    pil_image = None
-    if req.image_path:
-        from PIL import Image
-
-        rel = req.image_path.lstrip("/")
-        if ".." in rel or rel.startswith("/"):
-            raise HTTPException(400, "bad image_path")
-        src = DATA_DIR / rel
-        if not src.exists() or not src.is_file():
-            raise HTTPException(404, f"image not found: {rel}")
-        pil_image = Image.open(src).convert("RGBA" if req.rgba else "RGB")
-        if not req.width or not req.height:
-            width = max(256, (pil_image.width // 16) * 16)
-            height = max(256, (pil_image.height // 16) * 16)
-        else:
-            pil_image = pil_image.resize((width, height), Image.Resampling.LANCZOS)
-        prompt = f"{prompt}. {_strength_phrase(float(req.strength))}"
-
-    kwargs: dict[str, Any] = {
-        "prompt": prompt,
-        "width": width,
-        "height": height,
-        "num_inference_steps": steps,
-        "generator": generator,
-        "true_cfg_scale": req.true_cfg_scale,
-    }
-    if pil_image is not None:
-        kwargs["image"] = pil_image
-    if req.negative_prompt:
-        kwargs["negative_prompt"] = req.negative_prompt
-        if req.true_cfg_scale <= 1.0:
-            kwargs["true_cfg_scale"] = 4.0
 
     def on_step_end(pipe, step, timestep, callback_kwargs):
         if _is_cancelled(job_id):
@@ -269,7 +414,10 @@ def generate(req: GenerateRequest) -> dict:
         _set_progress(job_id, step=int(step) + 1, steps=steps, status="running")
         return callback_kwargs
 
-    kwargs["callback_on_step_end"] = on_step_end
+    call = prepare_still_call(req, generator=generator, on_step_end=on_step_end)
+    steps = call.steps
+    width = int(call.kwargs["width"])
+    height = int(call.kwargs["height"])
 
     t0 = time.time()
     try:
@@ -278,10 +426,10 @@ def generate(req: GenerateRequest) -> dict:
                 _set_progress(job_id, step=0, steps=steps, status="cancelled")
                 raise HTTPException(409, "cancelled")
             _set_progress(job_id, step=0, steps=steps, status="running")
-            result = _pipe(**kwargs)
+            result = _pipe(**call.kwargs)
         image = result.images[0]
-        if req.rgba and getattr(image, "mode", None) != "RGBA":
-            image = image.convert("RGBA")
+        if call.rgba and getattr(image, "mode", None) != call.output_mode:
+            image = image.convert(call.output_mode)
         image.save(out_path)
         elapsed = round(time.time() - t0, 2)
         _set_progress(job_id, step=steps, steps=steps, status="done")
@@ -297,9 +445,9 @@ def generate(req: GenerateRequest) -> dict:
             "steps": steps,
             "seed": seed,
             "elapsed_s": elapsed,
-            "rgba": bool(req.rgba),
-            "edited": pil_image is not None,
-            "strength": float(req.strength) if pil_image is not None else None,
+            "rgba": call.rgba,
+            "edited": call.edited,
+            "strength": float(req.strength) if call.edited else None,
         }
     except CancelledError:
         _set_progress(job_id, step=0, steps=steps, status="cancelled")
