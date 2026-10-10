@@ -49,7 +49,7 @@ export IMAGINE_PIN="choose-a-pin"          # unset default in code and scripts i
 
 Ports: portal `7860`, worker `7861`. The worker binds to localhost only. The portal is the public surface.
 
-Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=103` and `styles.css?v=102`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
+Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=105` and `styles.css?v=103`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
 
 `python-multipart` is required. Uploads fail without it.
 
@@ -138,7 +138,7 @@ Cancel is a file, `data/progress/{id}.cancel`, plus `status: cancelled` on the j
 
 `_build_gallery_items` lists done jobs. A still needs `data/images/{id}.png`. A video needs `data/videos/{id}.mp4`. A video may also have a poster PNG (from the reference still). Sort is newest `created_at` first. The list is cached until the jobs, images, or videos directory mtime changes, or `_bump_gallery` runs.
 
-Thumbs: `THUMB_PX` 512. JPEG quality 76 as `{id}.jpg`, or PNG when `rgba` is set. `_write_grid_thumb` is locked per filename and skips a non-empty existing thumb. A daemon warmer starts unless `IMAGINE_THUMB_WARM=0`.
+Thumbs: still tiles use the original PNG (`/api/images/{id}.png`) so the grid does not upscale a small JPEG. Video posters are `THUMB_PX` 512, JPEG quality 76 as `{id}.jpg`. `_write_grid_thumb` is locked per filename and skips a non-empty existing thumb. A daemon warmer starts unless `IMAGINE_THUMB_WARM=0` and only fills video posters.
 
 NSFW is `spicy` on the job, or `_NSFW_RE` on the prompts. The client blurs those tiles when `imagine_nsfw_blur` is on.
 
@@ -219,7 +219,7 @@ Edit: open `image_path`, convert to RGBA or RGB to match `rgba`, resize to the s
 
 Progress is in memory and in `/data/progress/{id}.json`: `id`, `step`, `steps`, `pct`, `status`, `updated_at`. The step callback writes `step + 1` and raises `CancelledError` when `{id}.cancel` exists. The portal polls its own job file, which merges this JSON. `GET /progress/{id}` exists for debugging.
 
-Success writes `/data/images/{id}.png` and returns `id`, `path`, `width`, `height`, `steps`, `seed`, `elapsed_s`, `rgba`, `edited`, `strength`. The portal copies the PNG onto its images dir when the paths differ, writes the thumb, and marks the job done.
+Success writes `/data/images/{id}.png` and returns `id`, `path`, `width`, `height`, `steps`, `seed`, `elapsed_s`, `rgba`, `edited`, `strength`. The portal copies the PNG onto its images dir when the paths differ and marks the job done. The gallery tile uses that PNG.
 
 The portal HTTP timeout for a still is 600 seconds.
 

@@ -215,6 +215,53 @@ class TurboDefaultsTest(unittest.TestCase):
         self.assertIn("Qwen/Qwen-Image-2.1-Turbo", launch)
         self.assertIn("transformers>=5.17.0", launch)
         self.assertIn("sample_sigmas", launch)
+        self.assertIn('if (it.kind !== "video" && it.image) return it.image;', js)
+        self.assertIn("app.js?v=105", html)
+
+    def test_still_gallery_thumb_uses_the_original_image(self) -> None:
+        client = TestClient(app.app)
+        still_id = "stillorig01"
+        video_id = "videothumb1"
+        still_png = app.IMAGES / f"{still_id}.png"
+        poster_png = app.IMAGES / f"{video_id}.png"
+        video_mp4 = app.VIDEOS / f"{video_id}.mp4"
+        Image.new("RGB", (896, 1152), (20, 40, 60)).save(still_png)
+        Image.new("RGB", (768, 1344), (60, 40, 20)).save(poster_png)
+        video_mp4.write_bytes(b"not-a-real-mp4")
+        app._write_job(still_id, {
+            "id": still_id,
+            "status": "done",
+            "kind": "image",
+            "prompt": "a red apple",
+            "width": 896,
+            "height": 1152,
+            "created_at": 10,
+        })
+        app._write_job(video_id, {
+            "id": video_id,
+            "status": "done",
+            "kind": "video",
+            "prompt": "the apple turns",
+            "created_at": 11,
+        })
+        try:
+            items = {
+                item["id"]: item
+                for item in client.get("/api/gallery", headers={"X-Imagine-Pin": "haku"}).json()["items"]
+            }
+            self.assertEqual(items[still_id]["thumb"], f"/api/images/{still_id}.png")
+            self.assertEqual(items[still_id]["image"], f"/api/images/{still_id}.png")
+            self.assertEqual(items[video_id]["thumb"], f"/api/thumbs/{video_id}.jpg")
+        finally:
+            for path in (
+                still_png,
+                poster_png,
+                video_mp4,
+                app.JOBS / f"{still_id}.json",
+                app.JOBS / f"{video_id}.json",
+            ):
+                path.unlink(missing_ok=True)
+            app._bump_gallery()
 
 
 if __name__ == "__main__":

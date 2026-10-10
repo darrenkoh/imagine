@@ -770,6 +770,7 @@
   }
 
   function thumbSrcFor(it) {
+    if (it.kind !== "video" && it.image) return it.image;
     if (it.thumb) return it.thumb;
     if (!it.image || !it.id) return "";
     return `/api/thumbs/${it.id}.${it.rgba ? "png" : "jpg"}`;

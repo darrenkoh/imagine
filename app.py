@@ -38,8 +38,8 @@ UPLOADS.mkdir(parents=True, exist_ok=True)
 VIDEOS.mkdir(parents=True, exist_ok=True)
 THUMBS.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA / "prompt_history.json"
-# Grid cells are ~200–400 CSS px. 512px JPEG covers a phone retina without
-# shipping the full 1280px PNG for every tile.
+# Video posters only. Still tiles use the original PNG so the grid is not
+# upscaling a small JPEG.
 THUMB_PX = 512
 _MEDIA_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
 
@@ -1402,11 +1402,6 @@ async def _run_generate(job_id: str, payload: dict, fallback_seed: Optional[int]
         if src.resolve() != dest.resolve():
             if src.exists():
                 shutil.copy2(src, dest)
-        try:
-            rgba = bool(job.get("rgba"))
-            _write_grid_thumb(dest, THUMBS / _thumb_name(job_id, rgba), rgba)
-        except Exception:
-            pass
         job.update(
             {
                 "status": "done",
@@ -1620,6 +1615,13 @@ def _build_gallery_items() -> list[dict]:
             continue
         rgba = bool(j.get("rgba"))
         user_prompt = _strip_frame(j.get("user_prompt") or j.get("prompt") or "")
+        image_url = f"/api/images/{job_id}.png" if poster.exists() else None
+        # Stills ship the original file. A 512px JPEG is upscaled in the grid and looks soft.
+        thumb_url = (
+            f"/api/thumbs/{_thumb_name(job_id, False)}"
+            if is_video and poster.exists()
+            else image_url
+        )
         rows.append(
             (
                 float(j.get("created_at") or 0),
@@ -1633,8 +1635,8 @@ def _build_gallery_items() -> list[dict]:
                     "nsfw": _is_nsfw(j),
                     "starred": bool(j.get("starred")),
                     "rgba": rgba,
-                    "image": f"/api/images/{job_id}.png" if poster.exists() else None,
-                    "thumb": f"/api/thumbs/{_thumb_name(job_id, rgba)}" if poster.exists() else None,
+                    "image": image_url,
+                    "thumb": thumb_url,
                     "video": f"/api/videos/{job_id}.mp4" if is_video else None,
                     "duration": j.get("duration"),
                     "resolution": j.get("resolution"),
@@ -1674,6 +1676,8 @@ def _warm_gallery_thumbs() -> None:
     except Exception:
         return
     for it in items:
+        if it.get("kind") != "video":
+            continue
         thumb = str(it.get("thumb") or "")
         name = thumb.rsplit("/", 1)[-1]
         if not name or "/" in name or ".." in name:
