@@ -198,9 +198,8 @@
     }
     const hint = $("h3Hint");
     if (hint) {
-      hint.textContent = h3Video
-        ? "Local H3 uses this image as the first frame. Leave motion blank for a gentle default."
-        : (h3Detail || "Local H3 is not ready.");
+      const readyText = "FastH3 V2 (8 steps, synced audio). Text-to-audio-video — a still is not the first frame. Fast is 832×480, about 5s is 124 frames, about 10s is 243 frames.";
+      hint.textContent = h3Video ? readyText : (h3Detail || "FastH3 V2 (8 steps, synced audio) is not ready.");
     }
   }
 
@@ -405,6 +404,9 @@
       const temp = gpuT || cpuT;
       const net = formatNetTelemetry(s.net);
       const load = [cpu, gpu, temp, mem, net].filter(Boolean).join(" · ");
+      const videoNote = h3Video
+        ? "FastH3 V2 (8 steps, synced audio)"
+        : "FastH3 V2 (8 steps, synced audio) not ready";
       if (ready) {
         pill.textContent = load ? `ready · ${load}` : "ready";
         pill.className = "ok";
@@ -418,8 +420,12 @@
         pill.textContent = load ? `worker down · ${load}` : "worker down";
         pill.className = "err";
       }
+      pill.textContent = `${pill.textContent} · ${videoNote}`;
       const ifaces = s.net && Array.isArray(s.net.ifaces) ? s.net.ifaces.filter(Boolean) : [];
-      pill.title = ifaces.length > 1 ? `${pill.textContent} (${ifaces.join(", ")})` : pill.textContent;
+      const titleBits = [];
+      if (!h3Video && h3Detail) titleBits.push(h3Detail);
+      if (ifaces.length > 1) titleBits.push(ifaces.join(", "));
+      pill.title = titleBits.length ? titleBits.join(" · ") : pill.textContent;
       if (s.pin_ok) $("gate").classList.add("hidden");
     } catch {
       $("statusPill").textContent = "offline";
@@ -1077,28 +1083,28 @@
 
   async function animate() {
     if (h3Known && !h3Video) {
-      alert(h3Detail || "Local H3 is not ready.");
-      return;
-    }
-    if (!animateImageId) {
-      alert("Drop a screenshot or choose an image first");
-      const drop = $("animateDrop");
-      if (drop) drop.focus();
+      alert(h3Detail || "FastH3 V2 (8 steps, synced audio) is not ready.");
       return;
     }
     const prompt = $("prompt").value.trim();
+    if (!prompt && !animateImageId) {
+      alert("Write a prompt. FastH3 V2 (8 steps, synced audio) is text-to-audio-video.");
+      $("prompt").focus();
+      return;
+    }
     const bar = beginProgress();
     bar.classList.add("indeterminate");
-    $("progressLabel").textContent = "H3 · starting";
+    $("progressLabel").textContent = "FastH3 V2 · starting";
     try {
+      const payload = {
+        prompt,
+        duration,
+        resolution,
+      };
+      if (animateImageId) payload.image_id = animateImageId;
       const started = await api("/api/animate", {
         method: "POST",
-        body: JSON.stringify({
-          prompt,
-          image_id: animateImageId,
-          duration,
-          resolution,
-        }),
+        body: JSON.stringify(payload),
       });
       const jobId = started.id;
       activeJobId = jobId;
@@ -1113,7 +1119,7 @@
         job = await api("/api/jobs/" + jobId);
         const remote = (job.provider_status || "").trim();
         const ahead = Number(job.queue_ahead);
-        let msg = remote && remote !== "queued" ? `H3 · ${remote}` : "H3 · starting";
+        let msg = remote && remote !== "queued" ? `FastH3 V2 · ${remote}` : "FastH3 V2 · starting";
         if (Number.isFinite(ahead) && ahead > 0) msg += ` · #${ahead + 1} ahead`;
         $("progressLabel").textContent = msg;
       }

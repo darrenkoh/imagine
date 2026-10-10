@@ -12,7 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # Isolate gallery writes before either module reads IMAGINE_DATA at import.
-os.environ["IMAGINE_DATA"] = tempfile.mkdtemp(prefix="imagine-turbo-")
+# If the portal module is already loaded, keep its directory so the worker
+# opens the same uploads the portal just wrote.
+_loaded = sys.modules.get("app")
+if _loaded is not None:
+    os.environ["IMAGINE_DATA"] = str(_loaded.DATA)
+else:
+    os.environ["IMAGINE_DATA"] = tempfile.mkdtemp(prefix="imagine-turbo-")
 os.environ["IMAGINE_PIN"] = "haku"
 os.environ.pop("IMAGINE_MODEL", None)
 
