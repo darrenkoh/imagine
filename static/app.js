@@ -65,6 +65,7 @@
   let lastJob = null;
   let sheetJob = null;
   let timer = null;
+  let composeExpanded = false;
 
   const $ = (id) => document.getElementById(id);
   const pinHeaders = () => {
@@ -99,6 +100,62 @@
     return body;
   }
 
+  function truncate(str, max) {
+    if (!str) return "";
+    return str.length > max ? str.slice(0, max) + "…" : str;
+  }
+
+  function updateComposeSummary() {
+    const pill = $("composeHeaderPill");
+    if (!pill) return;
+    const p = ($("prompt") ? $("prompt").value : "").trim();
+    if (task === "animate") {
+      pill.textContent = p ? `Animate · “${truncate(p, 20)}”` : `Animate · ${duration}s`;
+    } else if (task === "edit") {
+      pill.textContent = p ? `Edit · “${truncate(p, 20)}”` : `Edit · ${Math.round(strength * 100)}%`;
+    } else {
+      pill.textContent = p ? `“${truncate(p, 22)}”` : `New image · ${aspect ? aspect.label : "3:4"}`;
+    }
+  }
+
+  function setComposeExpanded(expanded, focusPrompt = false) {
+    composeExpanded = !!expanded;
+    const card = $("composeCard");
+    const layout = $("layoutWrap");
+    const navBtn = $("appbarComposeBtn");
+    const header = $("composeHeader");
+    const stateText = $("composeStateText");
+
+    if (card) {
+      card.classList.toggle("collapsed", !composeExpanded);
+    }
+    if (layout) {
+      layout.classList.toggle("compose-collapsed", !composeExpanded);
+    }
+    if (navBtn) {
+      navBtn.classList.toggle("active", composeExpanded);
+      navBtn.setAttribute("aria-expanded", String(composeExpanded));
+    }
+    if (header) {
+      header.setAttribute("aria-expanded", String(composeExpanded));
+      header.title = composeExpanded ? "Collapse compose panel (C)" : "Expand compose panel (C)";
+    }
+    if (stateText) {
+      stateText.textContent = composeExpanded ? "Collapse" : "Expand";
+    }
+    updateComposeSummary();
+
+    if (composeExpanded && focusPrompt) {
+      setTimeout(() => {
+        if ($("prompt")) $("prompt").focus();
+      }, 150);
+    }
+  }
+
+  function toggleComposePanel() {
+    setComposeExpanded(!composeExpanded, !composeExpanded);
+  }
+
   function renderChips(el, items, current, onPick, key = "id") {
     el.innerHTML = "";
     items.forEach((it) => {
@@ -125,6 +182,7 @@
     renderFramingChips();
     renderRgbaChips();
     renderAnimateChips();
+    updateComposeSummary();
   }
 
 
@@ -217,6 +275,7 @@
   async function useAnimateFile(file) {
     if (!file) return;
     task = "animate";
+    setComposeExpanded(true, true);
     refreshChips();
     try {
       const up = await uploadEditFile(file);
@@ -248,6 +307,7 @@
       $("prompt").value = text;
       autoGrowPrompt();
     }
+    setComposeExpanded(true, true);
     if (typeof closeSheet === "function") closeSheet();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -1307,6 +1367,7 @@
     $("prompt").value = text;
     if (job.negative_prompt != null) $("negative").value = job.negative_prompt || "";
     if (job.seed != null && $("seed")) $("seed").value = job.seed;
+    setComposeExpanded(true, true);
     autoGrowPrompt();
     $("prompt").focus();
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1318,6 +1379,7 @@
 
 
   function beginProgress() {
+    setComposeExpanded(true);
     $("generateBtn").disabled = true;
     cancelRequested = false;
     activeJobId = null;
@@ -1410,6 +1472,7 @@
     if (task === "animate") return animate();
     const prompt = $("prompt").value.trim();
     if (!prompt) {
+      setComposeExpanded(true, true);
       $("prompt").focus();
       return;
     }
@@ -1514,7 +1577,25 @@
     deleteGalleryIds([id]);
   };
 
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeSheet(); closeLightbox(); } });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeSheet();
+      closeLightbox();
+      return;
+    }
+    if ((e.key === "c" || e.key === "C") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const active = document.activeElement;
+      const tag = active ? active.tagName.toLowerCase() : "";
+      if (tag === "input" || tag === "textarea" || tag === "select" || (active && active.isContentEditable)) {
+        return;
+      }
+      if ($("gate") && !$("gate").classList.contains("hidden")) return;
+      if ($("sheet") && !$("sheet").classList.contains("hidden")) return;
+      if ($("lightbox") && !$("lightbox").classList.contains("hidden")) return;
+      e.preventDefault();
+      toggleComposePanel();
+    }
+  });
   $("generateBtn").onclick = generate;
   if ($("clearAll")) $("clearAll").onclick = clearAll;
   $("shuffleSeed").onclick = shuffleSeed;
@@ -1539,6 +1620,7 @@
   bindGalleryPaging();
   bindStatusRate();
   $("regenBtn").onclick = () => {
+    setComposeExpanded(true);
     if ((lastJob && lastJob.kind === "video") || task === "animate") {
       animate();
       return;
@@ -1561,11 +1643,22 @@
   
   const promptEl = $("prompt");
   if (promptEl) {
-    promptEl.addEventListener("input", autoGrowPrompt);
+    promptEl.addEventListener("input", () => {
+      autoGrowPrompt();
+      updateComposeSummary();
+    });
     promptEl.addEventListener("focus", autoGrowPrompt);
     window.addEventListener("resize", autoGrowPrompt);
     autoGrowPrompt();
   }
+
+  if ($("composeHeader")) {
+    $("composeHeader").onclick = toggleComposePanel;
+  }
+  if ($("appbarComposeBtn")) {
+    $("appbarComposeBtn").onclick = toggleComposePanel;
+  }
+  setComposeExpanded(false);
 
   
   if ($("editFile")) {
@@ -1775,6 +1868,7 @@
         task = "edit";
         $("editPreview").src = (up.url || url) + "?t=" + Date.now();
         $("editPreviewWrap").classList.remove("hidden");
+        setComposeExpanded(true, true);
         refreshChips();
         closeSheet();
         window.scrollTo({ top: 0, behavior: "smooth" });

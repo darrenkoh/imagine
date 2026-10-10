@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#07070b" />
   <title>Imagine</title>
-  <link rel="stylesheet" href="/static/styles.css?v=102" />
+  <link rel="stylesheet" href="/static/styles.css?v=103" />
 </head>
 <body>
   <div id="gate">
@@ -21,16 +21,45 @@
   </div>
 
   <header class="appbar">
-    <h1>Imagine</h1>
+    <div class="appbar-brand">
+      <h1>Imagine</h1>
+    </div>
+    <div class="appbar-actions">
+      <button type="button" class="compose-nav-btn" id="appbarComposeBtn" aria-expanded="false" title="Toggle compose panel (C)">
+        <span class="compose-nav-sparkle" aria-hidden="true">✨</span>
+        <span class="compose-nav-label">Compose</span>
+        <span class="compose-nav-key" aria-hidden="true">C</span>
+      </button>
+    </div>
   </header>
 
-  <div class="layout">
-    <section>
-      <div class="card">
-        <div class="field">
-          <label id="promptLabel">Prompt</label>
-          <textarea id="prompt" rows="8" placeholder="A neon koi swimming through misty bamboo at dusk…"></textarea>
-        </div>
+  <div class="layout compose-collapsed" id="layoutWrap">
+    <section class="compose-section" id="composeSection">
+      <div class="card compose-card collapsed" id="composeCard">
+        <button type="button" class="compose-header" id="composeHeader" aria-expanded="false" aria-controls="composeCollapsible" title="Expand compose panel (C)">
+          <div class="compose-header-left">
+            <span class="compose-sparkle-badge" aria-hidden="true">✨</span>
+            <div class="compose-header-titles">
+              <span class="compose-header-title">Compose</span>
+              <span class="compose-header-pill" id="composeHeaderPill">New image · 3:4</span>
+            </div>
+          </div>
+          <div class="compose-header-right">
+            <span class="compose-state-text" id="composeStateText">Expand</span>
+            <span class="compose-chevron" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </span>
+          </div>
+        </button>
+        <div class="compose-collapsible" id="composeCollapsible">
+          <div class="compose-collapsible-inner">
+            <div class="compose-inner-body">
+              <div class="field">
+                <label id="promptLabel">Prompt</label>
+                <textarea id="prompt" rows="8" placeholder="A neon koi swimming through misty bamboo at dusk…"></textarea>
+              </div>
         <label>Task</label>
         <div class="chips" id="taskChips"></div>
         <div id="animatePanel" class="field hidden">
@@ -104,6 +133,9 @@
         <div id="progressWrap" class="hidden">
           <div class="progress"><span id="progressLabel">Generating…</span><span id="elapsed">0s</span></div>
           <div class="bar"><i id="progressBar" style="width:0%"></i></div>
+        </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -195,6 +227,6 @@
   </footer>
 
   <div id="dropOverlay" class="drop-overlay hidden">Drop to animate with local H3</div>
-  <script src="/static/app.js?v=103"></script>
+  <script src="/static/app.js?v=104"></script>
 </body>
 </html>
