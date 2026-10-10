@@ -705,16 +705,44 @@ async def auth(request: Request) -> JSONResponse:
     return resp
 
 
+def _image_model_name(model: Optional[str]) -> str:
+    text = model or ""
+    if "Qwen-Image-2.1" in text:
+        return "Qwen Image 2.1"
+    if "qwen" in text.lower():
+        return "Qwen Image"
+    leaf = text.strip("/").split("/")[-1]
+    if not leaf:
+        return "Qwen Image 2.1"
+    return leaf.replace("-", " ").replace("_", " ")
+
+
+def _footer_model(worker: dict, h3_running: Optional[bool]) -> tuple[str, str]:
+    """Pill label for the model that is loaded, or the one still loading."""
+    image = _image_model_name((worker or {}).get("model"))
+    if (worker or {}).get("loading"):
+        return f"Loading Model {image}...", "loading"
+    if (worker or {}).get("ready"):
+        return image, "ready"
+    if h3_running:
+        return "MiniMax H3", "ready"
+    return "No model", "down"
+
+
 @app.get("/api/status")
 async def status(request: Request) -> dict:
     # Soft gate: allow unauthenticated status but omit pin confirmation
     wh = await _worker_health()
     video = _fasth3_v2_runtime()
+    h3_running = _docker_running("vllm-minimax-h3")
+    model_label, model_state = _footer_model(wh, h3_running)
     return {
         "ok": True,
         "time": time.time(),
         "worker": wh,
-        "h3_running": _docker_running("vllm-minimax-h3"),
+        "h3_running": h3_running,
+        "model_label": model_label,
+        "model_state": model_state,
         "h3_video": video["ready"],
         "h3_detail": video["detail"],
         "video_model": fasth3_v2.MODEL_NAME,

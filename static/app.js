@@ -462,33 +462,41 @@
     appendUnit(parent, unit);
   }
 
+  function imageModelName(model) {
+    const text = String(model || "");
+    if (/Qwen-Image-2\.1/i.test(text)) return "Qwen Image 2.1";
+    if (/qwen/i.test(text)) return "Qwen Image";
+    const leaf = text.split("/").filter(Boolean).pop() || "";
+    if (!leaf) return "Qwen Image 2.1";
+    return leaf.replace(/[-_]+/g, " ");
+  }
+
+  function footerModel(s) {
+    if (s && s.model_label) {
+      return { text: s.model_label, state: s.model_state || "ready" };
+    }
+    const worker = (s && s.worker) || {};
+    const imageName = imageModelName(worker.model);
+    if (worker.loading) return { text: "Loading Model " + imageName + "...", state: "loading" };
+    if (worker.ready) return { text: imageName, state: "ready" };
+    if (s && s.fasth3_running) return { text: "MiniMax H3 Turbo", state: "ready" };
+    if (s && s.h3_running) return { text: "MiniMax H3", state: "ready" };
+    return { text: "No model", state: "down" };
+  }
+
   async function pollStatus() {
     if (statusInFlight) return;
     statusInFlight = true;
     try {
       const s = await fetch("/api/status", { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.json());
       const pill = $("statusPill");
-      const ready = s.worker && s.worker.ready;
-      const loading = s.worker && s.worker.loading;
-      const h3 = s.h3_running;
       h3Video = !!s.h3_video;
       h3Detail = s.h3_detail || "";
       h3Known = true;
       syncTaskPanels();
-      let stateText = "worker down";
-      if (ready) {
-        stateText = "ready";
-        pill.className = "ok";
-      } else if (loading) {
-        stateText = "loading model";
-        pill.className = "warn";
-      } else if (h3) {
-        stateText = "H3 up (stop first)";
-        pill.className = "warn";
-      } else {
-        pill.className = "err";
-      }
-      pill.replaceChildren(document.createTextNode(stateText));
+      const model = footerModel(s);
+      pill.className = model.state === "ready" ? "ok" : model.state === "loading" ? "warn" : "err";
+      pill.replaceChildren(document.createTextNode(model.text));
       const addMetric = (fill) => {
         const el = document.createElement("span");
         fill(el);
