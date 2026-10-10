@@ -666,13 +666,29 @@ input[type="file"] {
 }
 .gitem .star.on { color:#ffd166; }
 .gitem.select-mode, .gallery.select-mode .gitem { outline: none; }
-.gitem.selected { outline:2px solid #6ea8fe; }
+.gitem.selected,
+.gallery.select-mode .gitem.selected { outline:2px solid #6ea8fe; outline-offset: -2px; }
 .gitem .sel-check {
-  position:absolute; right:6px; bottom:6px; z-index:2;
-  width:24px; height:24px; border-radius:6px;
-  background:#6ea8fe; color:#fff; font-size:14px;
+  position:absolute; right:4px; bottom:4px; z-index:2;
+  width:22px; height:22px; border-radius:6px;
+  background: rgba(0,0,0,.35);
+  border: 2px solid rgba(255,255,255,.92);
+  box-shadow: 0 1px 3px rgba(0,0,0,.45);
+  color:#fff; font-size:13px; font-weight:700;
   display:flex; align-items:center; justify-content:center;
 }
+.gitem.selected .sel-check {
+  background:#6ea8fe;
+  border-color:#6ea8fe;
+}
+.gallery.select-mode {
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 6px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.gallery.select-mode .gitem { border-radius: 8px; }
+.gallery.select-mode .gitem .star { display: none; }
 .gitem.rgba-thumb img, img.checker, #resultImg.checker, #sheetImg.checker {
   background:
     linear-gradient(45deg, #2a2a32 25%, transparent 25%) 0 0/16px 16px,

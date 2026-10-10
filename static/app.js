@@ -43,6 +43,8 @@
   let galleryFilter = localStorage.getItem('imagine_gallery_filter') || 'all';
   let selectMode = false;
   let selectedIds = new Set();
+  // Last image clicked without Shift. Shift-click selects through this image.
+  let selectAnchorId = null;
   let deletingIds = new Set();
   // Ids removed locally. A gallery refresh that started before the delete
   // returns must not put those cards back.
@@ -599,12 +601,53 @@
     }
   }
 
+  function visibleGalleryIds() {
+    return filteredGalleryItems().map((item) => item.id);
+  }
+
+  function selectGalleryRange(anchorId, targetId) {
+    const ids = visibleGalleryIds();
+    let start = ids.indexOf(anchorId);
+    const end = ids.indexOf(targetId);
+    if (end < 0) return;
+    if (start < 0) start = end;
+    const lo = Math.min(start, end);
+    const hi = Math.max(start, end);
+    for (let i = lo; i <= hi; i++) {
+      if (!deletingIds.has(ids[i])) selectedIds.add(ids[i]);
+    }
+  }
+
+  function refreshGallerySelection() {
+    const g = $("gallery");
+    if (!g) return;
+    for (const card of g.children) {
+      const it = itemById(card.dataset.id);
+      if (it) syncGalleryCard(card, it);
+    }
+  }
+
+  function selectGalleryClick(id, shiftKey) {
+    const current = itemById(id);
+    if (!current || deletingIds.has(current.id)) return;
+    if (shiftKey && selectAnchorId) {
+      selectGalleryRange(selectAnchorId, current.id);
+    } else {
+      if (selectedIds.has(current.id)) selectedIds.delete(current.id);
+      else selectedIds.add(current.id);
+      selectAnchorId = current.id;
+    }
+    refreshGallerySelection();
+    syncSelectUi();
+  }
+
   function createGalleryCard(it, eager) {
     const d = document.createElement("div");
     d.dataset.id = it.id;
     const img = document.createElement("img");
     img.alt = it.prompt || "";
     img.decoding = "async";
+    img.draggable = false;
     if (it.rgba) img.classList.add("checker");
     const full = it.image || "";
     if (full) img.dataset.full = full;
@@ -643,26 +686,29 @@
     img.addEventListener("pointerleave", clearPress);
     img.addEventListener("pointercancel", clearPress);
     img.onclick = (e) => {
+      if (selectMode) return;
       const current = itemById(d.dataset.id);
       if (!current || deletingIds.has(current.id)) return;
-      if (selectMode) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (selectedIds.has(current.id)) selectedIds.delete(current.id);
-        else selectedIds.add(current.id);
-        syncGalleryCard(d, current);
-        syncSelectUi();
-        return;
-      }
       if (longPressed) { e.preventDefault(); e.stopPropagation(); longPressed = false; return; }
       openSheet(current);
     };
+    d.addEventListener("click", (e) => {
+      if (!selectMode) return;
+      if (e.target.closest && e.target.closest("button")) return;
+      e.preventDefault();
+      selectGalleryClick(d.dataset.id, e.shiftKey);
+    });
     const star = document.createElement("button");
     star.type = "button";
     star.className = "star";
     star.title = "Star";
     star.onclick = async (e) => {
       e.stopPropagation();
+      if (selectMode) {
+        e.preventDefault();
+        selectGalleryClick(d.dataset.id, e.shiftKey);
+        return;
+      }
       const current = itemById(d.dataset.id);
       if (!current || deletingIds.has(current.id)) return;
       try {
@@ -740,6 +786,7 @@
       unique.forEach((id) => {
         deletingIds.delete(id);
         selectedIds.delete(id);
+        if (selectAnchorId === id) selectAnchorId = null;
         const card = galleryCardEl(id);
         if (card) card.classList.add("deleting-out");
       });
@@ -751,7 +798,11 @@
         });
         const empty = $("galleryEmpty");
         if (empty) empty.classList.toggle("hidden", filteredGalleryItems().length > 0);
-        if (batch) selectMode = false;
+        if (batch) {
+          selectMode = false;
+          selectAnchorId = null;
+          paintGallery();
+        }
         if (delBtn) delBtn.disabled = false;
         syncSelectUi();
       }, 180);
@@ -798,7 +849,10 @@
   function syncSelectUi() {
     const selBtn = $("selectModeBtn");
     const delBtn = $("deleteSelectedBtn");
-    if (selBtn) selBtn.textContent = selectMode ? "Done" : "Select";
+    if (selBtn) {
+      selBtn.textContent = selectMode ? "Done" : "Select";
+      selBtn.title = selectMode ? "Shift-click to select a range" : "Select images";
+    }
     if (delBtn) {
       delBtn.classList.toggle("hidden", !selectMode || selectedIds.size === 0);
       delBtn.textContent = selectedIds.size ? `Delete (${selectedIds.size})` : "Delete";
@@ -1400,7 +1454,10 @@
   if ($("selectModeBtn")) {
     $("selectModeBtn").onclick = () => {
       selectMode = !selectMode;
-      if (!selectMode) selectedIds.clear();
+      if (!selectMode) {
+        selectedIds.clear();
+        selectAnchorId = null;
+      }
       syncSelectUi();
       paintGallery();
     };
