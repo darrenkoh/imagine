@@ -18,7 +18,6 @@ from typing import Any, Optional
 import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 
-import fasth3_v2
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -155,22 +154,9 @@ class GenerateBody(BaseModel):
 
 class AnimateBody(BaseModel):
     prompt: Optional[str] = ""
-    image_id: Optional[str] = None
+    image_id: str = Field(..., min_length=1)
     duration: int = 5
     resolution: str = "fast"
-    # Explicit frames or pixels, when the caller sends them. Step counts are
-    # accepted and ignored: FastH3 V2 always uses eight DiT forwards.
-    num_frames: Optional[int] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    steps: Optional[int] = None
-    num_inference_steps: Optional[int] = None
-    seed: Optional[int] = None
-    model: Optional[str] = None
-
-
-# Shipped video entry. Tests call this; it does not load weights.
-normalize_fasth3_v2 = fasth3_v2.normalize_video_request
 
 
 def _check_pin(
@@ -733,7 +719,7 @@ def _footer_model(worker: dict, h3_running: Optional[bool]) -> tuple[str, str]:
 async def status(request: Request) -> dict:
     # Soft gate: allow unauthenticated status but omit pin confirmation
     wh = await _worker_health()
-    video = _fasth3_v2_runtime()
+    h3_ok, h3_detail = _h3_ready()
     h3_running = _docker_running("vllm-minimax-h3")
     model_label, model_state = _footer_model(wh, h3_running)
     return {
@@ -743,14 +729,8 @@ async def status(request: Request) -> dict:
         "h3_running": h3_running,
         "model_label": model_label,
         "model_state": model_state,
-        "h3_video": video["ready"],
-        "h3_detail": video["detail"],
-        "video_model": fasth3_v2.MODEL_NAME,
-        "video_steps": fasth3_v2.TRANSFORMER_FORWARDS,
-        "video_audio": "synced",
-        "video_label": fasth3_v2.VIDEO_LABEL,
-        "video_ready": video["ready"],
-        "video_detail": video["detail"],
+        "h3_video": h3_ok,
+        "h3_detail": h3_detail,
         "worker_container": _docker_running("imagine-qwen-worker"),
         "memory": _meminfo(),
         "cpu_percent": _cpu_percent(),
@@ -984,7 +964,7 @@ def _h3_failure_message(lines: list[str], code: int | None) -> str:
     if errors:
         return errors[-1][:500]
     tail = " ".join(line.strip() for line in lines[-8:] if line.strip())
-    return (tail or f"FastH3 V2 exited {code}")[:500]
+    return (tail or f"local h3 exited {code}")[:500]
 
 
 _H3_PROGRESS_RE = re.compile(r"([A-Za-z][\w .+-]{0,40}?)\s+(\d+)\s*/\s*(\d+)\s*$")
@@ -1059,287 +1039,61 @@ async def _halt_h3(proc: asyncio.subprocess.Process, pump: asyncio.Future) -> No
     await _finish_pump(pump)
 
 
-_video_guard = threading.Lock()
-_active_videos: set[str] = set()
-
-
-def _model_candidates() -> list[Path]:
-    home = Path.home()
-    return [
-        home / "models" / "FastVideo-FastH3-8-Step-V2-NVFP4-Consumer",
-        home / ".cache" / "huggingface" / "hub" / "models--FastVideo--FastVideo-FastH3-8-Step-V2-NVFP4-Consumer",
-    ]
-
-
-def _fasth3_v2_locations() -> tuple[Optional[Path], Optional[Path]]:
-    """Local CLI and weights. Never downloads."""
-    raw_bin = os.environ.get("FASTH3_V2_BIN", "").strip()
-    if raw_bin:
-        binary: Optional[Path] = Path(raw_bin).expanduser()
-    else:
-        found = shutil.which("fastvideo")
-        binary = Path(found) if found else None
-    raw_model = os.environ.get("FASTH3_V2_MODEL_DIR", "").strip()
-    if raw_model:
-        return binary, Path(raw_model).expanduser()
-    fallback = _model_candidates()[0]
-    for path in _model_candidates():
-        if path.is_dir():
-            return binary, path
-    return binary, fallback
-
-
-def _fasth3_v2_runtime() -> dict:
-    binary, model = _fasth3_v2_locations()
-    return fasth3_v2.inspect_runtime(binary, model)
-
-
-def _video_busy() -> bool:
-    with _video_guard:
-        return bool(_active_videos)
-
-
-def _mark_video(job_id: str) -> None:
-    with _video_guard:
-        _active_videos.add(job_id)
-
-
-def _clear_video(job_id: str) -> None:
-    with _video_guard:
-        _active_videos.discard(job_id)
-
-
-def _collect_mp4(out_dir: Path, dest: Path) -> None:
-    clips = [path for path in out_dir.rglob("*.mp4") if path.is_file() and path.stat().st_size > 0]
-    if not clips:
-        raise RuntimeError("FastH3 V2 finished without a non-empty MP4")
-    clips.sort(key=lambda path: path.stat().st_mtime)
-    best = clips[-1]
-    if best.resolve() != dest.resolve():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(best), dest)
-    if not dest.exists() or dest.stat().st_size <= 0:
-        raise RuntimeError("FastH3 V2 wrote an empty MP4")
-
 
 @app.post("/api/animate")
 async def api_animate(body: AnimateBody, _: None = Depends(_check_pin)) -> dict:
-    """Start one FastH3 V2 text-to-audio-video job. Illegal requests leave no job file."""
-    try:
-        contract = normalize_fasth3_v2(body.model_dump())
-    except fasth3_v2.FastH3V2Error as e:
-        raise HTTPException(400, str(e)) from e
+    ready, detail = _h3_ready()
+    if not ready:
+        raise HTTPException(400, detail)
+    duration = int(body.duration)
+    if duration < H3_DURATION_MIN or duration > H3_DURATION_MAX:
+        raise HTTPException(400, f"duration must be {H3_DURATION_MIN}–{H3_DURATION_MAX} seconds")
+    resolution = (body.resolution or "fast").strip().lower()
+    if resolution not in H3_RESOLUTIONS:
+        raise HTTPException(400, "resolution must be fast or 768p")
+    safe = _safe_upload_id(body.image_id)
+    src = UPLOADS / f"{safe}.png"
+    if not safe or not src.exists():
+        raise HTTPException(400, "upload not found — drop the image again")
+
     user_prompt = (body.prompt or "").strip()
-    motion = user_prompt or fasth3_v2.DEFAULT_PROMPT
+    motion = user_prompt or H3_DEFAULT_MOTION
     if len(motion) > 7000:
         raise HTTPException(400, "motion prompt is too long (max 7000 characters)")
-    contract["prompt"] = motion
-    # A supplied still is stored only as a reference. This backend does not
-    # accept first-frame conditioning, so the job must not claim that it did.
-    raw_image = (body.image_id or "").strip()
-    reference_id = ""
-    if raw_image:
-        reference_id = _safe_upload_id(raw_image)
-        src = UPLOADS / f"{reference_id}.png"
-        if not reference_id or not src.exists():
-            raise HTTPException(400, "upload not found — drop the image again")
-    runtime = _fasth3_v2_runtime()
-    if not runtime["ready"]:
-        raise HTTPException(400, runtime["detail"])
-    if _video_busy():
-        raise HTTPException(409, "a FastH3 V2 clip is already running")
 
     if user_prompt:
         try:
-            _history_add(user_prompt, "", width=contract["width"], height=contract["height"])
+            _history_add(user_prompt, "", width=None, height=None)
         except Exception:
             pass
 
     job_id = uuid.uuid4().hex[:12]
-    now = time.time()
     job = {
         "id": job_id,
         "kind": "video",
+        "model": "h3-local",
         "status": "queued",
         "provider_status": "queued",
         "user_prompt": user_prompt,
-        "created_at": now,
-        "updated_at": now,
+        "prompt": motion,
+        "image_id": safe,
+        "duration": duration,
+        "resolution": resolution,
+        "created_at": time.time(),
+        "updated_at": time.time(),
         "error": None,
         "elapsed_s": None,
         "image": None,
         "video": None,
         "pct": 0,
         "step": 0,
-        "image_id": None,
-        "reference_image_id": reference_id or None,
-        "first_frame": False,
     }
-    job.update(contract)
-    job["first_frame"] = False
-    job["conditioning"] = "t2av"
-    job["image_id"] = None
-    _mark_video(job_id)
-    try:
-        _write_job(job_id, job)
-        asyncio.create_task(_run_fasth3_v2(job_id, contract, runtime))
-        await asyncio.sleep(0)
-    except Exception:
-        _clear_video(job_id)
-        raise
+    _write_job(job_id, job)
+    asyncio.create_task(_run_animate(job_id, src, motion, duration, resolution))
     return job
 
 
-async def _run_fasth3_v2(job_id: str, contract: dict, runtime: dict) -> None:
-    t0 = time.time()
-    job = json.loads(_job_path(job_id).read_text())
-    dest = VIDEOS / f"{job_id}.mp4"
-    out_dir = VIDEOS / f"{job_id}-out"
-    config_path = PROGRESS / f"{job_id}-fasth3.yaml"
-
-    def _touch(**fields: Any) -> None:
-        job.update(fields)
-        job["updated_at"] = time.time()
-        job["elapsed_s"] = round(time.time() - t0, 2)
-        job["first_frame"] = False
-        job["conditioning"] = "t2av"
-        job["model"] = fasth3_v2.MODEL_NAME
-        _write_job(job_id, job)
-
-    def _cancelled() -> bool:
-        if (PROGRESS / f"{job_id}.cancel").exists():
-            return True
-        try:
-            current = json.loads(_job_path(job_id).read_text())
-        except Exception:
-            return False
-        return current.get("status") == "cancelled"
-
-    proc: asyncio.subprocess.Process | None = None
-    pump: asyncio.Future | None = None
-    try:
-        if _cancelled():
-            _touch(status="cancelled", error=None, pct=0)
-            return
-        binary = runtime.get("binary")
-        model_path = runtime.get("model_path")
-        if binary is None or model_path is None:
-            raise RuntimeError(runtime.get("detail") or "FastH3 V2 runtime is not ready")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(fasth3_v2.render_config(contract, Path(model_path), out_dir))
-        _touch(
-            status="running",
-            provider_status="FastH3 V2 starting",
-            pct=1,
-            steps=fasth3_v2.TRANSFORMER_FORWARDS,
-            transformer_forwards=fasth3_v2.TRANSFORMER_FORWARDS,
-            num_inference_steps=fasth3_v2.SIGMA_POINTS,
-        )
-        cmd = fasth3_v2.generation_command(Path(binary), config_path)
-        env = fasth3_v2.generation_env()
-        _touch(command=cmd)
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            ),
-            timeout=30,
-        )
-        notes: list[str] = []
-
-        def on_text(text: str) -> None:
-            line = text.strip()
-            if not line:
-                return
-            notes.append(line)
-            del notes[:-40]
-            match = _H3_PROGRESS_RE.search(line)
-            if not match:
-                return
-            phase = match.group(1).strip()
-            done = int(match.group(2))
-            total = max(1, int(match.group(3)))
-            _touch(
-                status="running",
-                provider_status=f"{phase} {done}/{total}",
-                pct=min(99, int(100 * done / total)),
-                step=done,
-                steps=fasth3_v2.TRANSFORMER_FORWARDS,
-            )
-
-        assert proc.stdout is not None and proc.stderr is not None
-        pump = asyncio.gather(
-            _read_h3_stream(proc.stderr, on_text),
-            _read_h3_stream(proc.stdout, on_text),
-        )
-        deadline = time.time() + 6 * 3600
-        while True:
-            if _cancelled():
-                await _halt_h3(proc, pump)
-                pump = None
-                _touch(status="cancelled", error=None, pct=0)
-                return
-            if time.time() > deadline:
-                await _halt_h3(proc, pump)
-                pump = None
-                raise RuntimeError("FastH3 V2 timed out after 6 hours")
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=0.4)
-                break
-            except asyncio.TimeoutError:
-                continue
-        await pump
-        pump = None
-        if _cancelled():
-            _touch(status="cancelled", error=None, pct=0)
-            return
-        if proc.returncode != 0:
-            raise RuntimeError(_h3_failure_message(notes, proc.returncode))
-        _collect_mp4(out_dir, dest)
-        reference = job.get("reference_image_id")
-        if reference:
-            src = UPLOADS / f"{reference}.png"
-            if src.exists():
-                try:
-                    poster = IMAGES / f"{job_id}.png"
-                    _save_poster(_open_rgb(src), poster)
-                    _write_grid_thumb(poster, THUMBS / _thumb_name(job_id, False), False)
-                except Exception:
-                    pass
-        _clear_video(job_id)
-        _touch(
-            status="done",
-            provider_status="done",
-            error=None,
-            pct=100,
-            step=fasth3_v2.TRANSFORMER_FORWARDS,
-            steps=fasth3_v2.TRANSFORMER_FORWARDS,
-            image=f"/api/images/{job_id}.png" if (IMAGES / f"{job_id}.png").exists() else None,
-            video=f"/api/videos/{job_id}.mp4",
-            elapsed_s=round(time.time() - t0, 2),
-        )
-    except HTTPException as e:
-        _clear_video(job_id)
-        _touch(status="error", error=str(e.detail), pct=0)
-    except Exception as e:
-        _clear_video(job_id)
-        _touch(status="error", error=str(e), pct=0)
-    finally:
-        _clear_video(job_id)
-        if proc is not None and proc.returncode is None:
-            _stop_h3(proc)
-        if pump is not None:
-            await _finish_pump(pump)
-        try:
-            (PROGRESS / f"{job_id}.cancel").unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-async def _run_animate(  # h3.c helper; POST /api/animate does not call this
+async def _run_animate(
     job_id: str,
     src: Path,
     motion: str,
@@ -2035,7 +1789,7 @@ def _fail_orphaned_video_jobs() -> None:
         if job.get("status") not in ("queued", "running"):
             continue
         job["status"] = "error"
-        job["error"] = "interrupted — the portal restarted before FastH3 V2 finished"
+        job["error"] = "interrupted — the portal restarted before local h3 finished"
         job["updated_at"] = time.time()
         _write_job(str(job.get("id") or p.stem), job)
 

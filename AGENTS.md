@@ -2,7 +2,7 @@
 
 Instructions for coding agents in this repository. Read this before changing the portal, the image worker, or video.
 
-This tree is the public Imagine app: a pin-gated web studio, a warm Qwen-Image-2.1-Turbo worker, and a FastH3 V2 video backend. FastH3 V2 is the MiniMax-H3 video stack this app runs (8 DiT forwards, synced audio, text-to-audio-video). It is the video API. The MiniMax cloud API is not wired in.
+This tree is the public Imagine app: a pin-gated web studio, a warm Qwen-Image-2.1-Turbo worker, and local MiniMax H3 video through the Apple Silicon `h3.c` binary. A still is the first frame. The MiniMax cloud API is not wired in. The live Spark portal's opening clips use the MiniMax H3 Turbo LoRA on the H3 server. That queue is not in this tree.
 
 ## Two trees
 
@@ -21,10 +21,9 @@ Do not rsync or overwrite the Spark tree with this one. Do not add series, still
 
 | Path | Role |
 |---|---|
-| `app.py` | Portal. HTTPS UI and JSON API on `:7860`. Proxies stills to the worker. Spawns FastH3 V2 for video. |
+| `app.py` | Portal. HTTPS UI and JSON API on `:7860`. Proxies stills to the worker. Spawns local `h3.c` for video. |
 | `static/index.html`, `static/app.js`, `static/styles.css` | The UI. Vanilla JS. No build step. |
 | `worker.py` | Qwen-Image-2.1-Turbo worker. Loaded once inside Docker. Listens on `127.0.0.1:7861`. |
-| `fasth3_v2.py` | Pure video request contract. No weights import, no download. |
 | `tls.py` | Self-signed cert for iPhone Safari. Trust page is `/trust`. |
 | `run_worker.sh` | Starts container `imagine-qwen-worker`. |
 | `run_portal.sh` | Uvicorn on `0.0.0.0:7860`. HTTPS unless `IMAGINE_HTTP=1`. |
@@ -32,7 +31,7 @@ Do not rsync or overwrite the Spark tree with this one. Do not add series, still
 | `launch_tmux.sh` | Stops container `vllm-minimax-h3`, then worker, then portal, then an optional smoke still. |
 | `stop_all.sh` | Removes the worker container and stops the portal. |
 | `tests/test_turbo_defaults.py` | Still defaults through the real portal payload and worker kwargs. No weights. |
-| `tests/test_fasth3_v2.py` | `POST /api/animate` against a fake `fastvideo` binary. No weights. |
+| `tests/test_h3_local.py` | `POST /api/animate` stays on local `h3.c`. No weights and no binary. |
 
 Python is 3.12 in `.venv`. System `python3` does not have FastAPI. Use `.venv/bin/python`.
 
@@ -50,14 +49,14 @@ export IMAGINE_PIN="choose-a-pin"          # unset default in code and scripts i
 
 Ports: portal `7860`, worker `7861`. The worker binds to localhost only. The portal is the public surface.
 
-Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=101` and `styles.css?v=102`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
+Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=103` and `styles.css?v=102`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
 
 `python-multipart` is required. Uploads fail without it.
 
 Tests, from the repo root:
 
 ```bash
-.venv/bin/python -m unittest tests.test_turbo_defaults tests.test_fasth3_v2
+.venv/bin/python -m unittest tests.test_turbo_defaults tests.test_h3_local
 ```
 
 Both files set `IMAGINE_DATA` to a temp directory before import when `app` is not already loaded. They must keep passing. Several tests read the served HTML, `app.js`, `README.md`, and `run_worker.sh`, so a renamed label or a step default other than 8 fails there. Update the test in the same change when the contract changes on purpose.
@@ -95,11 +94,11 @@ Header `X-Imagine-Pin` or the session cookie, unless noted.
 | Method | Path | Behavior |
 |---|---|---|
 | `POST` | `/api/auth` | Set the pin cookie. |
-| `GET` | `/api/status` | Worker health, FastH3 readiness, `h3_running`, CPU/GPU/temp, memory, network. Open. |
+| `GET` | `/api/status` | Worker health, local H3 readiness, `h3_running`, the loaded-model label, CPU/GPU/temp, memory, network. Open. |
 | `POST` | `/api/upload` | Image, max 25MB. Stored as `data/uploads/{id}.png`. Returns `{ id, path, url, width, height, mode }`. |
 | `GET` | `/api/uploads/{id}.png` | The upload. |
 | `POST` | `/api/generate` | Start a still. Returns the job JSON immediately. |
-| `POST` | `/api/animate` | Start one FastH3 V2 clip. See the video section. |
+| `POST` | `/api/animate` | Start one local H3 clip from a still. See the video section. |
 | `GET` | `/api/jobs/{id}` | Job plus live progress and queue stats. |
 | `POST` | `/api/jobs/{id}/cancel` | Writes `data/progress/{id}.cancel` and marks the job cancelled. |
 | `GET` | `/api/gallery` | Done stills and clips that still have their file. |
@@ -127,13 +126,13 @@ Job ids are 12 hex chars. Files are `data/jobs/{id}.json`, written via a temp fi
 
 Kind is `job["kind"]` or `"image"`. Video jobs set `kind` to `video`.
 
-`_read_job` for a video job returns the job file as written. It does not merge `data/progress/{id}.json`. That file belongs to the image worker. A video poll must keep `steps` at 8 and must not pick up a 49-step still progress file.
+`_read_job` for a video job returns the job file as written. It does not merge `data/progress/{id}.json`. That file belongs to the image worker. A video poll must not pick up a still progress file.
 
 For an image job, `_read_job` merges the progress file while status is `queued` or `running`. Status `running` with step 0, or with no progress file yet, is reported back as `queued` so the UI can show the wait state. Done image jobs report `pct` 100.
 
 `_queue_stats` counts earlier queued/running jobs of the same kind and sets `eta_s` from the median `elapsed_s` of up to 8 recent done jobs of that kind.
 
-Cancel is a file, `data/progress/{id}.cancel`, plus `status: cancelled` on the job. The worker checks that file between denoising steps. FastH3 checks it while the subprocess runs. A portal restart marks leftover queued/running video jobs as error: `interrupted — the portal restarted before FastH3 V2 finished`.
+Cancel is a file, `data/progress/{id}.cancel`, plus `status: cancelled` on the job. The worker checks that file between denoising steps. Local H3 checks it while the subprocess runs. A portal restart marks leftover queued/running video jobs as error: `interrupted — the portal restarted before local h3 finished`.
 
 ### Gallery
 
@@ -157,7 +156,7 @@ Long-press a thumb (480ms) reuses the prompt without opening the sheet. Sheet ac
 
 `#statusPill` is filled by `pollStatus()` from `GET /api/status`. The loop is `setTimeout` (`restartStatusLoop` / `runStatusPoll`). A poll still in flight is skipped. Elapsed request time is subtracted so intervals do not stack. The rate control is `#statusRate`.
 
-The state word is `ready`, `loading model`, `H3 up (stop first)`, `worker down`, or `offline`. `H3 up (stop first)` means the worker is down and Docker container `vllm-minimax-h3` is running. That container is a separate LLM. `launch_tmux.sh` stops it before starting the Qwen worker. It is not the video backend. `h3_video` / `video_ready` are FastH3 V2 readiness.
+The leading label is the loaded model. `/api/status` sends `model_label` and `model_state` (`ready`, `loading`, `down`). Qwen ready is `Qwen Image 2.1`. A Qwen load is `Loading Model Qwen Image 2.1...`. Docker container `vllm-minimax-h3`, when the image worker is down, is `MiniMax H3`. Nothing loaded is `No model`. The pill class is `ok`, `warn`, or `err`. That container is a separate LLM. `launch_tmux.sh` stops it before starting the Qwen worker. It is not this tree's video backend. `h3_video` / `h3_detail` are local `h3.c` readiness. The pill also appends `Local H3` or `Local H3 not ready`.
 
 Each number keeps a fixed width with `visibility: hidden` characters (`.num-ghost`, `aria-hidden`). Percents and temperature use 3 digits. Memory uses 3 digits and one decimal, and a whole value hides `.0`. Rates use the visible precision already in `appendRate`, with unused characters on the left of the shown digits. The tooltip is the visible text (`shownText`). A missing reading is omitted. The state word is not padded. One NIC name is prefixed when `net.ifaces` has a single entry. Several names go in the tooltip.
 
@@ -181,7 +180,7 @@ Inside the container the model path is `/models/Qwen-Image-2.1-Turbo`. If `model
 
 `GET /health` returns `ok`, `loading`, `ready`, `error`, `model`, `uptime_s`, `ready_at`, `compiled`. `model` is `Qwen/Qwen-Image-2.1-Turbo` when the path contains `Qwen-Image-2.1-Turbo`. The portal's `/api/status` field `worker` is this payload. `worker_container` is whether Docker container `imagine-qwen-worker` is running.
 
-Qwen-Image and a 70B LLM do not share a 120GB box. FastH3 V2 weights are the same order of size as the Qwen worker. This portal does not stop the Qwen container before a clip. On one Spark, stop the worker before a long FastH3 run and start it again after.
+Qwen-Image and a 70B LLM do not share a 120GB box. This portal does not stop the Qwen container before a clip. On the Spark, the video batch stops the worker before MiniMax H3 and starts it again after.
 
 ### `POST /generate`
 
@@ -226,80 +225,32 @@ The portal HTTP timeout for a still is 600 seconds.
 
 ## MiniMax H3 video backend
 
-The shipped video API is FastH3 V2. The checkpoint is `FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4-Consumer`. The architecture is MiniMax-H3 (`layer_profile` `h3_dit_vsa`, attention `VIDEO_SPARSE_ATTN_H3`, env `FASTVIDEO_MINIMAX_H3_FUSIONS=all`). The job model string is `FastH3 V2`. The status label is `FastH3 V2 (8 steps, synced audio)`.
+This tree's video API is local MiniMax H3 through `h3.c`. The job model string is `h3-local`. The still is the first frame. There is no `MINIMAX_API_KEY` and no `https://api.minimax.io` client.
 
-`POST /api/animate` calls `fasth3_v2.normalize_video_request` and then `_run_fasth3_v2`. It spawns `fastvideo generate`. It does not call `_run_animate`, `_h3_command`, or the `h3.c` binary.
-
-There is no `MINIMAX_API_KEY` and no `https://api.minimax.io` client in this repo.
-
-### What the other H3 names mean
-
-`h3_running` on `/api/status` is Docker container `vllm-minimax-h3`. That is an LLM. The footer uses it only for `H3 up (stop first)`.
-
-`_run_animate` and the helpers above it (`_h3_paths`, `_h3_ready`, `_h3_canvas`, `_fit_h3_still`, `_h3_command`) are the unused Apple Silicon `h3.c` path. Binary default `~/src/h3.c/h3` (`H3_BIN`). Weights default `~/src/h3.c/MiniMax-H3` (`H3_MODEL_DIR`), and only count when a `.safetensors` file is present. That helper would pass `--first-frame`, `--layers` (45 on a machine of 40GB or less, else 50, override `H3_LAYERS`), `--steps` (default 20, override `H3_STEPS`), and `--ssd-streaming` on a small machine (`H3_SSD_STREAMING`). Do not connect `api_animate` to this helper. Tests read the route source and reject `--first-frame`, `--layers`, and `--ssd-streaming` on the command that actually launches.
+The live Spark portal is a different tree. Its opening clips use the 8-step MiniMax H3 Turbo LoRA (`--quality turbo` on `generate_minimax_h3.sh`). Storyboard clips stay on full MiniMax H3. Do not point this tree's `POST /api/animate` at FastH3 V2 or at the Spark video queue.
 
 ### `POST /api/animate`
 
-`AnimateBody`: `prompt`, `image_id`, `duration` (default 5), `resolution` (default `fast`), optional `num_frames`, `width`, `height`, `steps`, `num_inference_steps`, `seed`, `model`.
+`AnimateBody`: `prompt` (optional), `image_id` (required), `duration` (default 5), `resolution` (default `fast`).
 
-`normalize_video_request` is the only mapping. Caller `steps`, `num_inference_steps`, shifts, and sparsity are ignored. A `model` string, when present, must name FastH3 V2 (`fasth3v2`, or `8stepv2` together with `fasth3`). Names containing trim, preview, 4-step, h3-local, h3.c, or minimaxh3 are rejected.
+`image_id` must already exist as `data/uploads/{id}.png`. Duration is 1–15 seconds. Resolution is `fast` or `768p`. An empty prompt uses `H3_DEFAULT_MOTION`. Prompt max is 7000 characters. An illegal body is HTTP 400, or 422 when `image_id` is missing, and writes no job file. Readiness is checked before the job file is written.
 
-Fixed contract written onto the job:
-
-| Field | Value |
-|---|---|
-| `model` | `FastH3 V2` |
-| `model_id` | `FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4-Consumer` |
-| `layer_profile` | `h3_dit_vsa` |
-| `attention_backend` | `VIDEO_SPARSE_ATTN_H3` |
-| `transformer_forwards`, `steps` | 8 |
-| `sigma_points`, `num_inference_steps` | 9 |
-| `dmd_denoising_steps` | 999, 874, 749, 624, 500, 375, 250, 125 |
-| `video_scheduler_shift` | 10 |
-| `audio_scheduler_shift` | 3 |
-| `vsa_sparsity` | 0.8 |
-| `vsa_tile_size` | 64 |
-| `vsa_kernel` | `triton` |
-| `fa4`, `sm100a` | false |
-| `vae_tiling`, `synced_audio`, `audio` | true |
-| `task`, `conditioning` | `t2av` |
-| `first_frame`, `accepts_first_frame` | false |
-| `fps` | 24 |
-| `guidance_scale` | 1 |
-
-Frame count is `17n+5` at 24 fps, at least 5, and strictly under 345. Five seconds is 124 frames. Six seconds is 141. Ten seconds is 243. A request whose raw `seconds * 24` is 345 or more is rejected (a 15 second chip does not exist, and 15 seconds does not start a job). An explicit `num_frames` must already be a legal count under 345. An illegal body is HTTP 400 and writes no job file.
-
-Canvases: `fast` / `480p` / `480` / `832x480` are 832×480. `768p` / `768` / `1344x768` are 1344×768. An explicit width and height must both be set, sit on a 32-pixel grid, have a short edge of at most 768 and a long edge of at most 1344. Preview, trim, and off-grid sizes are rejected.
-
-The recipe is text-to-audio-video. A supplied `image_id` must already exist as `data/uploads/{id}.png`. It is stored as `reference_image_id` and is not sent to FastVideo. The job's `image_id` stays null and `first_frame` stays false. On success the portal may copy that upload into `data/images/{id}.png` as a gallery poster. Empty prompt uses `fasth3_v2.DEFAULT_PROMPT`. Prompt max is 7000 characters. Default seed is 1234 when the caller omits it.
-
-One clip at a time. A second `POST /api/animate` while one is active is 409. Readiness is checked before the job file is written.
+The job stores `model` `h3-local`, the user's prompt, the upload id, the duration, and the resolution.
 
 ### Launch
 
-Readiness (`inspect_runtime`) does not download weights. It looks for `FASTH3_V2_BIN` or `fastvideo` on `PATH`, and `FASTH3_V2_MODEL_DIR` or `~/models/FastVideo-FastH3-8-Step-V2-NVFP4-Consumer` (Hugging Face hub cache is the second candidate). The directory must contain `fastvideo_inference.json` and a `.safetensors` file. `checkpoint_problem` refuses a trim/preview/4-step id, a forward count other than 8, a sigma count other than 9, a video shift other than 10, an audio shift other than 3, a sparsity other than 0.8, or a different DMD ladder. `model_path` passed to generate is the directory that holds `fastvideo_inference.json`.
+Readiness (`_h3_ready`) does not download weights. It looks for `H3_BIN` or `~/src/h3.c/h3`, and `H3_MODEL_DIR` or `~/src/h3.c/MiniMax-H3`. The weights directory counts only when it contains a `.safetensors` file. `/api/status` reports that on `h3_video` / `h3_detail`.
 
-`/api/status` reports `video_label`, `video_steps` (8), `video_audio` (`synced`), `video_ready`, `video_detail`, and the same readiness on `h3_video` / `h3_detail`. The UI copies `video_label` into `#h3Hint` and the animate progress line.
+`_run_animate` letterboxes the still, then runs `h3` with `--first-frame`, `--steps` (default 20, override `H3_STEPS`), `--layers` (45 on a machine of 40GB or less, else 50, override `H3_LAYERS`), and `--ssd-streaming` on a small machine (`H3_SSD_STREAMING`). The child is its own session (`start_new_session=True`). Stop it with `killpg` on that session only. `killpg` on the portal's own group would kill the portal. Progress lines matching `Phase N/M` update `provider_status`, `pct`, and `step`. The UI polls once a second and shows `H3 · {provider_status}`. Timeout is 6 hours. Cancel and a non-zero exit go through `_halt_h3` / `_h3_failure_message`.
 
-`_run_fasth3_v2` writes `data/progress/{id}-fasth3.yaml` and runs:
+On success the first frame is saved as the gallery poster and the MP4 is `data/videos/{id}.mp4`.
 
-```text
-nice -n 19 <fastvideo> generate --config <yaml>
-```
-
-`generation_env` forces `FASTVIDEO_MINIMAX_H3_FUSIONS=all`, `FASTVIDEO_NVFP4_MM_BACKEND=cutlass`, `FASTVIDEO_H3_VAE_TILE_BATCH=1`, `FASTVIDEO_VSA_TRITON=1`, `FASTVIDEO_VSA_SM100A=0`, `FASTVIDEO_FA4=0`, `FASTVIDEO_ATTENTION_BACKEND=VIDEO_SPARSE_ATTN_H3`, `FASTVIDEO_STAGE_LOGGING=1`. A caller environment that set FA4 or sm100a is overwritten.
-
-The YAML is the one-GPU NVFP4 recipe: `workload_type: t2v`, `vae_tiling: true`, `video_decode_backend: h3-vae`, `num_inference_steps: 9`, `guidance_scale: 1`, empty negative prompt, `save_video: true`. No image path, no `first_frame`, compile off, offload off. Output dir is `data/videos/{id}-out`. The newest non-empty MP4 there is moved to `data/videos/{id}.mp4`.
-
-The child is its own session (`start_new_session=True`). Stop it with `killpg` on that session only. `killpg` on the portal's own group would kill the portal. Progress lines matching `Phase N/M` update `provider_status`, `pct`, and `step`. The UI polls once a second and shows `FastH3 V2 · {provider_status}`. Timeout is 6 hours. Cancel and a non-zero exit go through `_halt_h3` / `_h3_failure_message`.
-
-While the job runs, `_touch` rewrites `model` to `FastH3 V2`, `first_frame` to false, and `conditioning` to `t2av` on every update.
+`h3_running` on `/api/status` is Docker container `vllm-minimax-h3`. That is an LLM, not this animate path.
 
 ## Change rules
 
 - Keep still defaults on the saved 8-step Turbo schedule at CFG 1 with `use_kv_cache`. A different step count is an explicit `sigmas` list of that length.
-- Keep video on the FastH3 V2 contract above. Do not add a preview, trim, 4-forward, or ~49-forward schedule switch.
-- A still attached to animate stays a reference. Do not set `first_frame` or pass the PNG into the FastVideo config.
+- Keep this tree's video on local `h3.c` with the still as `--first-frame`. Do not route `POST /api/animate` through FastH3 V2.
 - Do not merge image-worker progress into a video job.
 - An illegal animate request must leave no job file.
 - Desktop layout stays `1.1fr .9fr` unless the task changes it.

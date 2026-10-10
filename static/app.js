@@ -208,8 +208,9 @@
     }
     const hint = $("h3Hint");
     if (hint) {
-      const readyText = "FastH3 V2 (8 steps, synced audio). Text-to-audio-video — a still is not the first frame. Fast is 832×480, about 5s is 124 frames, about 10s is 243 frames.";
-      hint.textContent = h3Video ? readyText : (h3Detail || "FastH3 V2 (8 steps, synced audio) is not ready.");
+      hint.textContent = h3Video
+        ? "Local H3 uses this image as the first frame. Leave motion blank for a gentle default."
+        : (h3Detail || "Local H3 is not ready.");
     }
   }
 
@@ -531,9 +532,7 @@
         el.append(" ↑ ");
         appendRate(el, s.net.tx_bps);
       });
-      const videoNote = h3Video
-        ? "FastH3 V2 (8 steps, synced audio)"
-        : "FastH3 V2 (8 steps, synced audio) not ready";
+      const videoNote = h3Video ? "Local H3" : "Local H3 not ready";
       pill.append(" · " + videoNote);
       const ifaces = s.net && Array.isArray(s.net.ifaces) ? s.net.ifaces.filter(Boolean) : [];
       const titleBits = [];
@@ -1350,28 +1349,28 @@
 
   async function animate() {
     if (h3Known && !h3Video) {
-      alert(h3Detail || "FastH3 V2 (8 steps, synced audio) is not ready.");
+      alert(h3Detail || "Local H3 is not ready.");
+      return;
+    }
+    if (!animateImageId) {
+      alert("Drop a screenshot or choose an image first");
+      const drop = $("animateDrop");
+      if (drop) drop.focus();
       return;
     }
     const prompt = $("prompt").value.trim();
-    if (!prompt && !animateImageId) {
-      alert("Write a prompt. FastH3 V2 (8 steps, synced audio) is text-to-audio-video.");
-      $("prompt").focus();
-      return;
-    }
     const bar = beginProgress();
     bar.classList.add("indeterminate");
-    $("progressLabel").textContent = "FastH3 V2 · starting";
+    $("progressLabel").textContent = "H3 · starting";
     try {
-      const payload = {
-        prompt,
-        duration,
-        resolution,
-      };
-      if (animateImageId) payload.image_id = animateImageId;
       const started = await api("/api/animate", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          prompt,
+          image_id: animateImageId,
+          duration,
+          resolution,
+        }),
       });
       const jobId = started.id;
       activeJobId = jobId;
@@ -1386,7 +1385,7 @@
         job = await api("/api/jobs/" + jobId);
         const remote = (job.provider_status || "").trim();
         const ahead = Number(job.queue_ahead);
-        let msg = remote && remote !== "queued" ? `FastH3 V2 · ${remote}` : "FastH3 V2 · starting";
+        let msg = remote && remote !== "queued" ? `H3 · ${remote}` : "H3 · starting";
         if (Number.isFinite(ahead) && ahead > 0) msg += ` · #${ahead + 1} ahead`;
         $("progressLabel").textContent = msg;
       }
