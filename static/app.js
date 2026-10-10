@@ -45,6 +45,7 @@
   const PAGE_SIZE_DEFAULT = 30;
   let pageSize = readPageSize();
   const STATUS_RATE_KEY = "imagine_status_ms";
+  const STATUS_RATES = [500, 1000, 1500, 2000, 2500, 3000];
   const STATUS_RATE_DEFAULT = 500;
   let statusRate = readStatusRate();
   let statusTimer = 0;
@@ -364,33 +365,101 @@
     }
   }
 
-  function formatBitrate(bytesPerSec) {
-    if (bytesPerSec == null || !Number.isFinite(bytesPerSec) || bytesPerSec < 0) return "";
-    const bits = bytesPerSec * 8;
-    const units = [
-      [1e9, "Gb/s"],
-      [1e6, "Mb/s"],
-      [1e3, "kb/s"],
-    ];
-    for (const [scale, unit] of units) {
-      if (bits >= scale) {
-        const v = bits / scale;
-        const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
-        const text = v.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d)0$/, "$1");
-        return `${text} ${unit}`;
-      }
-    }
-    return `${Math.round(bits)} b/s`;
+  function shownText(node) {
+    let out = "";
+    node.childNodes.forEach((child) => {
+      if (child.nodeType === 3) out += child.textContent;
+      else if (child.nodeType === 1 && !child.classList.contains("num-ghost")) out += shownText(child);
+    });
+    return out;
   }
 
-  function formatNetTelemetry(net) {
-    if (!net || net.rx_bps == null || net.tx_bps == null) return "";
-    const down = formatBitrate(net.rx_bps);
-    const up = formatBitrate(net.tx_bps);
-    if (!down || !up) return "";
-    const names = Array.isArray(net.ifaces) ? net.ifaces.filter(Boolean) : [];
-    const label = names.length === 1 ? `${names[0]} ` : "";
-    return `${label}↓ ${down} ↑ ${up}`;
+  function numGhost(text) {
+    const el = document.createElement("span");
+    el.className = "num-ghost";
+    el.setAttribute("aria-hidden", "true");
+    el.textContent = text;
+    return el;
+  }
+
+  // Leading zeros stay in the layout and are hidden, so 1% occupies the
+  // same width as 100%. A whole memory value hides ".0" the same way.
+  function appendPaddedInt(parent, value, digits) {
+    const n = Math.max(0, Math.round(Number(value)));
+    let text = String(n);
+    if (text.length > digits) {
+      parent.append(text);
+      return;
+    }
+    text = text.padStart(digits, "0");
+    const cutAt = text.search(/[1-9]/);
+    const cut = cutAt === -1 ? text.length - 1 : cutAt;
+    if (cut > 0) parent.append(numGhost(text.slice(0, cut)));
+    parent.append(text.slice(cut));
+  }
+
+  function appendPaddedDecimal(parent, value, intDigits, fracDigits) {
+    const fixed = Math.abs(Number(value)).toFixed(fracDigits);
+    const split = fixed.split(".");
+    const intRaw = split[0];
+    const frac = split[1] || "";
+    if (intRaw.length > intDigits) {
+      parent.append(fixed);
+      return;
+    }
+    const intPart = intRaw.padStart(intDigits, "0");
+    let visibleInt = intPart.replace(/^0+/, "");
+    if (!visibleInt) visibleInt = "0";
+    const intHidden = intPart.slice(0, intPart.length - visibleInt.length);
+    if (intHidden) parent.append(numGhost(intHidden));
+    const showFrac = fracDigits > 0 && !/^0+$/.test(frac);
+    if (fracDigits > 0 && !showFrac) parent.append(numGhost("." + frac));
+    parent.append(visibleInt);
+    if (showFrac) parent.append("." + frac);
+  }
+
+  // kb/s, Mb/s, and Gb/s share one width. The wider names stay in the
+  // grid and are hidden, so a unit change does not resize the metric.
+  function appendUnit(parent, unit) {
+    const el = document.createElement("span");
+    el.className = "rate-unit";
+    for (const name of ["kb/s", "Mb/s", "Gb/s"]) el.append(numGhost(name));
+    const face = document.createElement("span");
+    face.className = "rate-unit-face";
+    face.textContent = unit;
+    el.append(face);
+    parent.append(el);
+  }
+
+  function appendRate(parent, bytesPerSec) {
+    const bits = Math.max(0, Number(bytesPerSec) * 8);
+    let v;
+    let unit;
+    if (bits >= 1e9) { v = bits / 1e9; unit = "Gb/s"; }
+    else if (bits >= 1e6) { v = bits / 1e6; unit = "Mb/s"; }
+    else { v = bits / 1e3; unit = "kb/s"; }
+    const split = v.toFixed(2).split(".");
+    const intRaw = split[0];
+    const fracRaw = split[1];
+    if (intRaw.length > 3) {
+      parent.append(intRaw + "." + fracRaw + " ");
+      appendUnit(parent, unit);
+      return;
+    }
+    const intPart = intRaw.padStart(3, "0");
+    const mag = Number(intRaw);
+    const showFrac = mag >= 100 ? 0 : mag >= 10 ? 1 : 2;
+    const fracShown = fracRaw.slice(0, showFrac).replace(/0+$/, "");
+    let visibleInt = intPart.replace(/^0+/, "");
+    if (!visibleInt) visibleInt = "0";
+    const intHidden = intPart.slice(0, intPart.length - visibleInt.length);
+    const hiddenFrac = (fracShown ? "" : ".") + fracRaw.slice(fracShown.length);
+    const hidden = intHidden + hiddenFrac;
+    if (hidden) parent.append(numGhost(hidden));
+    parent.append(visibleInt);
+    if (fracShown) parent.append("." + fracShown);
+    parent.append(" ");
+    appendUnit(parent, unit);
   }
 
   async function pollStatus() {
@@ -406,37 +475,64 @@
       h3Detail = s.h3_detail || "";
       h3Known = true;
       syncTaskPanels();
-      const mem = s.memory && s.memory.mem_available_gb != null ? `${s.memory.mem_available_gb}G free` : "";
-      const cpu = s.cpu_percent != null ? `CPU ${Math.round(s.cpu_percent)}%` : "";
-      const gpu = s.gpu_percent != null ? `GPU ${Math.round(s.gpu_percent)}%` : "";
-      const gpuT = s.gpu_temp_c != null ? `${Math.round(s.gpu_temp_c)}°C` : "";
-      const cpuT = s.cpu_temp_c != null ? `CPU ${Math.round(s.cpu_temp_c)}°C` : "";
-      // Prefer GPU temp (most meaningful on Spark); fall back to CPU package temp
-      const temp = gpuT || cpuT;
-      const net = formatNetTelemetry(s.net);
-      const load = [cpu, gpu, temp, mem, net].filter(Boolean).join(" · ");
+      let stateText = "worker down";
+      if (ready) {
+        stateText = "ready";
+        pill.className = "ok";
+      } else if (loading) {
+        stateText = "loading model";
+        pill.className = "warn";
+      } else if (h3) {
+        stateText = "H3 up (stop first)";
+        pill.className = "warn";
+      } else {
+        pill.className = "err";
+      }
+      pill.replaceChildren(document.createTextNode(stateText));
+      const addMetric = (fill) => {
+        const el = document.createElement("span");
+        fill(el);
+        pill.append(" · ");
+        pill.append(el);
+      };
+      if (s.cpu_percent != null) addMetric((el) => {
+        el.append("CPU ");
+        appendPaddedInt(el, s.cpu_percent, 3);
+        el.append("%");
+      });
+      if (s.gpu_percent != null) addMetric((el) => {
+        el.append("GPU ");
+        appendPaddedInt(el, s.gpu_percent, 3);
+        el.append("%");
+      });
+      const tempC = s.gpu_temp_c != null ? s.gpu_temp_c : s.cpu_temp_c;
+      if (tempC != null && Number.isFinite(Number(tempC))) addMetric((el) => {
+        if (s.gpu_temp_c == null) el.append("CPU ");
+        appendPaddedInt(el, tempC, 3);
+        el.append("°C");
+      });
+      if (s.memory && s.memory.mem_available_gb != null) addMetric((el) => {
+        appendPaddedDecimal(el, s.memory.mem_available_gb, 3, 1);
+        el.append("G free");
+      });
+      if (s.net && s.net.rx_bps != null && s.net.tx_bps != null) addMetric((el) => {
+        const names = Array.isArray(s.net.ifaces) ? s.net.ifaces.filter(Boolean) : [];
+        if (names.length === 1) el.append(names[0] + " ");
+        el.append("↓ ");
+        appendRate(el, s.net.rx_bps);
+        el.append(" ↑ ");
+        appendRate(el, s.net.tx_bps);
+      });
       const videoNote = h3Video
         ? "FastH3 V2 (8 steps, synced audio)"
         : "FastH3 V2 (8 steps, synced audio) not ready";
-      if (ready) {
-        pill.textContent = load ? `ready · ${load}` : "ready";
-        pill.className = "ok";
-      } else if (loading) {
-        pill.textContent = load ? `loading model · ${load}` : "loading model";
-        pill.className = "warn";
-      } else if (h3) {
-        pill.textContent = load ? `H3 up (stop first) · ${load}` : "H3 up (stop first)";
-        pill.className = "warn";
-      } else {
-        pill.textContent = load ? `worker down · ${load}` : "worker down";
-        pill.className = "err";
-      }
-      pill.textContent = `${pill.textContent} · ${videoNote}`;
+      pill.append(" · " + videoNote);
       const ifaces = s.net && Array.isArray(s.net.ifaces) ? s.net.ifaces.filter(Boolean) : [];
       const titleBits = [];
       if (!h3Video && h3Detail) titleBits.push(h3Detail);
       if (ifaces.length > 1) titleBits.push(ifaces.join(", "));
-      pill.title = titleBits.length ? titleBits.join(" · ") : pill.textContent;
+      const shown = shownText(pill);
+      pill.title = titleBits.length ? titleBits.join(" · ") : shown;
       if (s.pin_ok) $("gate").classList.add("hidden");
     } catch {
       $("statusPill").textContent = "offline";
@@ -448,10 +544,18 @@
   }
 
   function clampStatusRate(value) {
-    if (value == null || String(value).trim() === "") return STATUS_RATE_DEFAULT;
     const n = Math.round(Number(value));
     if (!Number.isFinite(n)) return STATUS_RATE_DEFAULT;
-    return Math.max(100, Math.min(60000, n));
+    let best = STATUS_RATE_DEFAULT;
+    let bestDist = Infinity;
+    for (const rate of STATUS_RATES) {
+      const dist = Math.abs(rate - n);
+      if (dist < bestDist) {
+        best = rate;
+        bestDist = dist;
+      }
+    }
+    return best;
   }
 
   function readStatusRate() {
@@ -492,13 +596,6 @@
       restartStatusLoop();
     };
     el.addEventListener("change", commit);
-    el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        commit();
-        el.blur();
-      }
-    });
   }
 
   
