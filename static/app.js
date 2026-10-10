@@ -41,6 +41,10 @@
   if (!RESOLUTIONS.some((mode) => mode.id === resolution)) resolution = "fast";
   let strength = Number(localStorage.getItem('imagine_strength') || 0.65);
   let galleryFilter = localStorage.getItem('imagine_gallery_filter') || 'all';
+  const PAGE_SIZE_KEY = "imagine_page_size";
+  const PAGE_SIZE_DEFAULT = 30;
+  let pageSize = readPageSize();
+  let galleryPage = 1;
   let selectMode = false;
   let selectedIds = new Set();
   // Last image clicked without Shift. Shift-click selects through this image.
@@ -501,8 +505,10 @@
       b.onclick = () => {
         galleryFilter = f.id;
         localStorage.setItem("imagine_gallery_filter", galleryFilter);
+        galleryPage = 1;
         renderGalleryFilters();
         paintGallery();
+        scrollGalleryToTop();
       };
       el.appendChild(b);
     });
@@ -798,17 +804,11 @@
       });
       if (sheetJob && gone.has(sheetJob.id)) closeSheet();
       window.setTimeout(() => {
-        unique.forEach((id) => {
-          const card = galleryCardEl(id);
-          if (card) dropCard(card);
-        });
-        const empty = $("galleryEmpty");
-        if (empty) empty.classList.toggle("hidden", filteredGalleryItems().length > 0);
         if (batch) {
           selectMode = false;
           selectAnchorId = null;
-          paintGallery();
         }
+        paintGallery();
         if (delBtn) delBtn.disabled = false;
         syncSelectUi();
       }, 180);
@@ -825,20 +825,119 @@
     }
   }
 
+  function clampPageSize(value) {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return PAGE_SIZE_DEFAULT;
+    return Math.max(1, Math.min(200, n));
+  }
+
+  function readPageSize() {
+    try {
+      const saved = localStorage.getItem(PAGE_SIZE_KEY);
+      if (saved != null && saved !== "") return clampPageSize(saved);
+    } catch (_) {}
+    return PAGE_SIZE_DEFAULT;
+  }
+
+  function pageWindow(total, page) {
+    const count = Math.max(0, Math.trunc(Number(total)) || 0);
+    const pages = Math.max(1, Math.ceil(count / pageSize));
+    let current = Math.trunc(Number(page)) || 1;
+    if (current < 1) current = 1;
+    if (current > pages) current = pages;
+    const start = (current - 1) * pageSize;
+    return { pages, current, start, end: Math.min(count, start + pageSize), count };
+  }
+
+  function syncPageSizeInputs() {
+    const el = $("galleryPageSize");
+    if (el && document.activeElement !== el) el.value = String(pageSize);
+  }
+
+  function syncPager(prefix, total, page) {
+    const win = pageWindow(total, page);
+    const root = $(prefix + "Pager");
+    if (root) root.classList.toggle("hidden", win.count === 0);
+    const label = $(prefix + "PageLabel");
+    if (label) {
+      label.textContent = win.count
+        ? (win.start + 1) + "-" + win.end + " of " + win.count + " · " + win.current + "/" + win.pages
+        : "";
+    }
+    const prev = $(prefix + "PagePrev");
+    const next = $(prefix + "PageNext");
+    if (prev) prev.disabled = win.current <= 1;
+    if (next) next.disabled = win.current >= win.pages;
+    return win;
+  }
+
+  function writePageSize(value) {
+    const start = (galleryPage - 1) * pageSize;
+    pageSize = clampPageSize(value);
+    galleryPage = Math.floor(start / pageSize) + 1;
+    try { localStorage.setItem(PAGE_SIZE_KEY, String(pageSize)); } catch (_) {}
+    syncPageSizeInputs();
+  }
+
+  function scrollGalleryToTop() {
+    const scroller = document.querySelector(".gallery-scroll");
+    if (scroller) {
+      scroller.scrollTop = 0;
+      return;
+    }
+    const pager = $("galleryPager");
+    if (pager && !pager.classList.contains("hidden") && pager.scrollIntoView) {
+      pager.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function bindGalleryPaging() {
+    const size = $("galleryPageSize");
+    if (size) {
+      size.value = String(pageSize);
+      size.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          size.blur();
+        }
+      });
+      size.addEventListener("change", () => {
+        writePageSize(size.value);
+        size.value = String(pageSize);
+        paintGallery();
+      });
+    }
+    const prev = $("galleryPagePrev");
+    const next = $("galleryPageNext");
+    if (prev) prev.addEventListener("click", () => {
+      galleryPage -= 1;
+      paintGallery();
+      scrollGalleryToTop();
+    });
+    if (next) next.addEventListener("click", () => {
+      galleryPage += 1;
+      paintGallery();
+      scrollGalleryToTop();
+    });
+  }
+
   function paintGallery() {
     const g = $("gallery");
     if (!g) return;
     g.classList.toggle("select-mode", selectMode);
     const items = filteredGalleryItems();
+    const page = syncPager("gallery", items.length, galleryPage);
+    galleryPage = page.current;
+    const pageItems = items.slice(page.start, page.end);
     const empty = $("galleryEmpty");
     if (empty) empty.classList.toggle("hidden", items.length > 0);
-    const want = new Set(items.map((it) => it.id));
+    const want = new Set(pageItems.map((it) => it.id));
     for (const child of Array.from(g.children)) {
       if (!want.has(child.dataset.id)) dropCard(child);
     }
     const byId = new Map();
     for (const child of g.children) byId.set(child.dataset.id, child);
-    items.forEach((it, index) => {
+    pageItems.forEach((it, index) => {
       let card = byId.get(it.id);
       if (!card) {
         card = createGalleryCard(it, index < 12);
@@ -1270,6 +1369,7 @@
   }
 
   $("refreshGallery").onclick = loadGallery;
+  bindGalleryPaging();
   $("regenBtn").onclick = () => {
     if ((lastJob && lastJob.kind === "video") || task === "animate") {
       animate();
