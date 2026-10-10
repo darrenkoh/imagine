@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#07070b" />
   <title>Imagine</title>
-  <link rel="stylesheet" href="/static/styles.css?v=95" />
+  <link rel="stylesheet" href="/static/styles.css?v=96" />
 </head>
 <body>
   <div id="gate">
@@ -180,10 +180,15 @@
   </div>
   
   <footer class="status-footer" id="statusFooter">
+    <label class="status-rate" title="How often the footer telemetry refreshes">
+      <span>every</span>
+      <input id="statusRate" type="number" min="100" max="60000" step="100" inputmode="numeric" aria-label="Telemetry refresh milliseconds" />
+      <span>ms</span>
+    </label>
     <div id="statusPill">checking…</div>
   </footer>
 
   <div id="dropOverlay" class="drop-overlay hidden">Drop a still for reference. FastH3 V2 (8 steps, synced audio) does not use it as the first frame.</div>
-  <script src="/static/app.js?v=96"></script>
+  <script src="/static/app.js?v=97"></script>
 </body>
 </html>

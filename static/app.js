@@ -44,6 +44,11 @@
   const PAGE_SIZE_KEY = "imagine_page_size";
   const PAGE_SIZE_DEFAULT = 30;
   let pageSize = readPageSize();
+  const STATUS_RATE_KEY = "imagine_status_ms";
+  const STATUS_RATE_DEFAULT = 500;
+  let statusRate = readStatusRate();
+  let statusTimer = 0;
+  let statusInFlight = false;
   let galleryPage = 1;
   let selectMode = false;
   let selectedIds = new Set();
@@ -389,6 +394,8 @@
   }
 
   async function pollStatus() {
+    if (statusInFlight) return;
+    statusInFlight = true;
     try {
       const s = await fetch("/api/status", { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.json());
       const pill = $("statusPill");
@@ -435,7 +442,63 @@
       $("statusPill").textContent = "offline";
       $("statusPill").className = "err";
       $("statusPill").removeAttribute("title");
+    } finally {
+      statusInFlight = false;
     }
+  }
+
+  function clampStatusRate(value) {
+    if (value == null || String(value).trim() === "") return STATUS_RATE_DEFAULT;
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return STATUS_RATE_DEFAULT;
+    return Math.max(100, Math.min(60000, n));
+  }
+
+  function readStatusRate() {
+    try {
+      const saved = localStorage.getItem(STATUS_RATE_KEY);
+      if (saved != null && saved !== "") return clampStatusRate(saved);
+    } catch (_) {}
+    return STATUS_RATE_DEFAULT;
+  }
+
+  function restartStatusLoop() {
+    if (statusTimer) {
+      clearTimeout(statusTimer);
+      statusTimer = 0;
+    }
+    statusTimer = setTimeout(runStatusPoll, statusRate);
+  }
+
+  async function runStatusPoll() {
+    statusTimer = 0;
+    const started = performance.now();
+    await pollStatus();
+    if (statusTimer) return;
+    const wait = Math.max(0, statusRate - (performance.now() - started));
+    statusTimer = setTimeout(runStatusPoll, wait);
+  }
+
+  function bindStatusRate() {
+    const el = $("statusRate");
+    if (!el) return;
+    el.value = String(statusRate);
+    const commit = () => {
+      const next = clampStatusRate(el.value);
+      el.value = String(next);
+      if (next === statusRate) return;
+      statusRate = next;
+      try { localStorage.setItem(STATUS_RATE_KEY, String(statusRate)); } catch (_) {}
+      restartStatusLoop();
+    };
+    el.addEventListener("change", commit);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit();
+        el.blur();
+      }
+    });
   }
 
   
@@ -1370,6 +1433,7 @@
 
   $("refreshGallery").onclick = loadGallery;
   bindGalleryPaging();
+  bindStatusRate();
   $("regenBtn").onclick = () => {
     if ((lastJob && lastJob.kind === "video") || task === "animate") {
       animate();
@@ -1617,5 +1681,5 @@
   }
   renderGalleryFilters();
 
-  setInterval(pollStatus, 5000);
+  restartStatusLoop();
 })();
