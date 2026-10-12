@@ -1074,34 +1074,83 @@
     return { pages, current, start, end: Math.min(count, start + pageSize), count };
   }
 
-  function syncPageSizeInputs() {
-    const el = $("galleryPageSize");
-    if (el && document.activeElement !== el) el.value = String(pageSize);
+  // While the rail is dragged, the thumb follows the pointer. Otherwise it sits on the current page.
+  let pageRailDrag = null;
+
+  function railFraction(pages, page) {
+    if (pages <= 1) return 0;
+    return (page - 1) / (pages - 1);
+  }
+
+  function pageFromFraction(pages, fraction) {
+    if (pages <= 1) return 1;
+    const t = Math.min(1, Math.max(0, fraction));
+    return Math.round(t * (pages - 1)) + 1;
+  }
+
+  function pageDotPx(pages) {
+    if (pages > 60) return 4;
+    if (pages > 30) return 5;
+    if (pages > 16) return 6;
+    return 8;
+  }
+
+  function fractionFromRailEvent(rail, clientX) {
+    const track = rail.querySelector(".page-rail-track");
+    const rect = (track || rail).getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    return (clientX - rect.left) / rect.width;
   }
 
   function syncPager(prefix, total, page) {
     const win = pageWindow(total, page);
     const root = $(prefix + "Pager");
-    if (root) root.classList.toggle("hidden", win.count === 0);
-    const label = $(prefix + "PageLabel");
-    if (label) {
-      label.textContent = win.count
-        ? (win.start + 1) + "-" + win.end + " of " + win.count + " · " + win.current + "/" + win.pages
-        : "";
+    if (root) root.classList.toggle("hidden", win.pages < 2);
+    const dots = $(prefix + "PageDots");
+    if (dots) {
+      dots.style.setProperty("--dot", pageDotPx(win.pages) + "px");
+      if (dots.dataset.pages !== String(win.pages)) {
+        dots.dataset.pages = String(win.pages);
+        dots.replaceChildren();
+        for (let i = 1; i <= win.pages; i++) {
+          const dot = document.createElement("span");
+          dot.className = "page-dot";
+          dot.dataset.page = String(i);
+          dot.style.left = (railFraction(win.pages, i) * 100) + "%";
+          dots.appendChild(dot);
+        }
+      }
+      const drag = pageRailDrag && pageRailDrag.prefix === prefix ? pageRailDrag : null;
+      const marked = drag ? pageFromFraction(win.pages, drag.fraction) : win.current;
+      for (const dot of dots.children) {
+        dot.classList.toggle("is-current", Number(dot.dataset.page) === marked);
+      }
     }
-    const prev = $(prefix + "PagePrev");
-    const next = $(prefix + "PageNext");
-    if (prev) prev.disabled = win.current <= 1;
-    if (next) next.disabled = win.current >= win.pages;
+    const rail = $(prefix + "PageRail");
+    if (rail) {
+      rail.setAttribute("aria-label", galleryFilter === "videos" ? "Video pages" : "Gallery pages");
+      rail.setAttribute("aria-valuemin", "1");
+      rail.setAttribute("aria-valuemax", String(win.pages));
+      rail.setAttribute("aria-valuenow", String(win.current));
+      rail.setAttribute("aria-valuetext", "Page " + win.current + " of " + win.pages);
+    }
+    const drag = pageRailDrag && pageRailDrag.prefix === prefix ? pageRailDrag : null;
+    const t = Math.min(1, Math.max(0, drag ? drag.fraction : railFraction(win.pages, win.current)));
+    const thumb = $(prefix + "PageThumb");
+    if (thumb) thumb.style.left = (t * 100) + "%";
     return win;
   }
 
-  function writePageSize(value) {
-    const start = (galleryPage - 1) * pageSize;
-    pageSize = clampPageSize(value);
-    galleryPage = Math.floor(start / pageSize) + 1;
-    try { localStorage.setItem(PAGE_SIZE_KEY, String(pageSize)); } catch (_) {}
-    syncPageSizeInputs();
+  function goToGalleryPage(page, dragging) {
+    const items = filteredGalleryItems();
+    const win = pageWindow(items.length, page);
+    if (win.current !== galleryPage) {
+      galleryPage = win.current;
+      paintGallery();
+    } else {
+      syncPager("gallery", items.length, galleryPage);
+    }
+    if (!dragging) scrollGalleryToTop();
   }
 
   function scrollGalleryToTop() {
@@ -1117,29 +1166,55 @@
   }
 
   function bindGalleryPaging() {
-    const size = $("galleryPageSize");
-    if (size) {
-      size.value = String(pageSize);
-      size.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          size.blur();
-        }
+    const rail = $("galleryPageRail");
+    if (rail && rail.dataset.bound !== "1") {
+      rail.dataset.bound = "1";
+      function moveToPointer(e) {
+        const pages = Number(rail.getAttribute("aria-valuemax")) || 1;
+        const fraction = fractionFromRailEvent(rail, e.clientX);
+        pageRailDrag = { prefix: "gallery", fraction, startPage: pageRailDrag ? pageRailDrag.startPage : galleryPage };
+        goToGalleryPage(pageFromFraction(pages, fraction), true);
+      }
+      rail.addEventListener("pointerdown", (e) => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        if (e.cancelable) e.preventDefault();
+        rail.focus({ preventScroll: true });
+        rail.classList.add("is-dragging");
+        pageRailDrag = { prefix: "gallery", fraction: 0, startPage: galleryPage };
+        try { rail.setPointerCapture(e.pointerId); } catch (_) {}
+        moveToPointer(e);
       });
-      size.addEventListener("change", () => {
-        writePageSize(size.value);
-        size.value = String(pageSize);
-        paintGallery();
+      rail.addEventListener("pointermove", (e) => {
+        if (!pageRailDrag || !rail.classList.contains("is-dragging")) return;
+        moveToPointer(e);
+      });
+      rail.addEventListener("pointerup", (e) => {
+        if (!pageRailDrag || !rail.classList.contains("is-dragging")) return;
+        const pages = Number(rail.getAttribute("aria-valuemax")) || 1;
+        const page = pageFromFraction(pages, fractionFromRailEvent(rail, e.clientX));
+        pageRailDrag = null;
+        rail.classList.remove("is-dragging");
+        goToGalleryPage(page, false);
+      });
+      rail.addEventListener("pointercancel", () => {
+        if (!pageRailDrag) return;
+        const start = pageRailDrag.startPage || 1;
+        pageRailDrag = null;
+        rail.classList.remove("is-dragging");
+        goToGalleryPage(start, false);
+      });
+      rail.addEventListener("keydown", (e) => {
+        const pages = Number(rail.getAttribute("aria-valuemax")) || 1;
+        let next = null;
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") next = galleryPage + 1;
+        else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = galleryPage - 1;
+        else if (e.key === "Home") next = 1;
+        else if (e.key === "End") next = pages;
+        else return;
+        e.preventDefault();
+        goToGalleryPage(next, false);
       });
     }
-    const prev = $("galleryPagePrev");
-    const next = $("galleryPageNext");
-    if (prev) prev.addEventListener("click", () => {
-      turnGalleryPage(-1);
-    });
-    if (next) next.addEventListener("click", () => {
-      turnGalleryPage(1);
-    });
     bindGallerySwipe();
   }
 

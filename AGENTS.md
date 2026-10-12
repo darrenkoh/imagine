@@ -49,7 +49,7 @@ export IMAGINE_PIN="choose-a-pin"          # unset default in code and scripts i
 
 Ports: portal `7860`, worker `7861`. The worker binds to localhost only. The portal is the public surface.
 
-Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=105` and `styles.css?v=103`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
+Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=108` and `styles.css?v=107`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
 
 `python-multipart` is required. Uploads fail without it.
 
@@ -142,9 +142,9 @@ Thumbs: still tiles use the original PNG (`/api/images/{id}.png`) so the grid do
 
 NSFW is `spicy` on the job, or `_NSFW_RE` on the prompts. The client blurs those tiles when `imagine_nsfw_blur` is on.
 
-Filters: All, Starred, Spicy, Normal. Changing the filter returns to page 1.
+Filters: All, Videos, Starred, Spicy, Normal. Changing the filter returns to page 1.
 
-Paging is client-side. One page size for the gallery. The label is `1-30 of N · page/pages`. Changing the size keeps the first item of the current page in view.
+Paging is client-side. One page size for the gallery and the Videos filter, stored in `imagine_page_size` (default 30, clamp 1–200). The control is one horizontal rail, hidden when that list has a single page. Dots sit evenly along the line, one per page. Drag the rail or click a dot to open that page. Arrow keys move one page when the rail is focused.
 
 Select mode: a click toggles one id and sets `selectAnchorId`. Shift-click adds every id in `filteredGalleryItems()` between the anchor and the target, inclusive, and skips ids already deleting. That range is the full filtered list, including items on other pages. Image clicks do not open the sheet while selecting. Leaving Select, or a multi-delete, clears the anchor and the selection. While selecting, `.gallery.select-mode` uses `repeat(auto-fill, minmax(92px, 1fr))`, hides stars, and shows `.sel-check`.
 

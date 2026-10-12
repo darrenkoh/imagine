@@ -216,7 +216,11 @@ class TurboDefaultsTest(unittest.TestCase):
         self.assertIn("transformers>=5.17.0", launch)
         self.assertIn("sample_sigmas", launch)
         self.assertIn('if (it.kind !== "video" && it.image) return it.image;', js)
-        self.assertIn("app.js?v=107", html)
+        self.assertIn("styles.css?v=107", html)
+        self.assertIn('id="galleryPageRail"', html)
+        self.assertNotIn("galleryPagePrev", html)
+        self.assertNotIn("galleryPageSize", html)
+        self.assertIn("app.js?v=108", html)
 
     def test_still_gallery_thumb_uses_the_original_image(self) -> None:
         client = TestClient(app.app)

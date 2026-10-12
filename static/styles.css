@@ -917,42 +917,75 @@ input[type="file"] {
 .gallery.select-mode .gitem { border-radius: 8px; }
 .gallery.select-mode .gitem .star { display: none; }
 .pager {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  flex: 0 0 auto;
-  margin: 0 0 10px;
+  margin: 0 0 6px;
 }
-.pager-btn {
-  flex: 0 0 auto;
-  min-height: 40px;
-  padding: 0 14px;
-  font-size: 14px;
+.page-rail {
+  position: relative;
+  height: 40px;
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
 }
-.pager-btn:disabled { opacity: .4; }
-.pager-label {
-  flex: 1 1 auto;
-  min-width: 8em;
-  font-size: 13px;
-  color: var(--muted);
+.page-rail.is-dragging { cursor: grabbing; }
+.page-rail:focus,
+.page-rail:focus-visible { outline: none; }
+.page-rail:focus-visible .page-rail-thumb {
+  box-shadow: 0 0 0 4px rgba(139, 108, 255, 0.45), 0 1px 5px rgba(0, 0, 0, 0.45);
 }
-.pager-size {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 0 0 auto;
-  margin: 0;
-  text-transform: none;
-  letter-spacing: 0;
-  font-size: 13px;
-  color: var(--muted);
+.page-rail-track {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 0;
+  bottom: 0;
 }
-.pager-size input {
-  width: 4.4rem;
-  min-height: 40px;
-  padding: 0 8px;
-  border-radius: 10px;
+.page-rail-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 999px;
+  background: #4a4a62;
+  pointer-events: none;
+}
+.page-rail-dots {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.page-dot {
+  position: absolute;
+  top: 50%;
+  width: var(--dot, 8px);
+  height: var(--dot, 8px);
+  margin-left: calc(var(--dot, 8px) / -2);
+  margin-top: calc(var(--dot, 8px) / -2);
+  border-radius: 50%;
+  background: #b7b7c9;
+}
+.page-dot.is-current { background: #fff; }
+.page-rail-thumb {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 0%;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  margin-top: -8px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  transition: left 0.12s ease, transform 0.12s ease;
+}
+.page-rail.is-dragging .page-rail-thumb { transition: none; transform: scale(1.12); }
+@media (prefers-reduced-motion: reduce) {
+  .page-rail-thumb { transition: none; }
 }
 .gallery-viewport {
   position: relative;
