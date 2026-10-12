@@ -122,7 +122,6 @@
     composeExpanded = !!expanded;
     const card = $("composeCard");
     const layout = $("layoutWrap");
-    const navBtn = $("appbarComposeBtn");
     const header = $("composeHeader");
     const stateText = $("composeStateText");
 
@@ -131,10 +130,6 @@
     }
     if (layout) {
       layout.classList.toggle("compose-collapsed", !composeExpanded);
-    }
-    if (navBtn) {
-      navBtn.classList.toggle("active", composeExpanded);
-      navBtn.setAttribute("aria-expanded", String(composeExpanded));
     }
     if (header) {
       header.setAttribute("aria-expanded", String(composeExpanded));
@@ -1851,9 +1846,6 @@
 
   if ($("composeHeader")) {
     $("composeHeader").onclick = toggleComposePanel;
-  }
-  if ($("appbarComposeBtn")) {
-    $("appbarComposeBtn").onclick = toggleComposePanel;
   }
   setComposeExpanded(false);
 
