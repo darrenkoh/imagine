@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#07070b" />
   <title>Imagine</title>
-  <link rel="stylesheet" href="/static/styles.css?v=103" />
+  <link rel="stylesheet" href="/static/styles.css?v=104" />
 </head>
 <body>
   <div id="gate">
@@ -174,7 +174,11 @@
             <input id="galleryPageSize" type="number" min="1" max="200" step="1" value="30" inputmode="numeric" aria-label="Items per page" />
           </label>
         </div>
-        <div class="gallery" id="gallery"></div>
+        <div class="gallery-viewport" id="galleryViewport">
+          <div class="gallery-track" id="galleryTrack">
+            <div class="gallery" id="gallery"></div>
+          </div>
+        </div>
         <p id="galleryEmpty" class="gallery-empty hidden">Nothing yet — generate a still, or drop one to animate.</p>
       </div>
     </section>
@@ -227,6 +231,6 @@
   </footer>
 
   <div id="dropOverlay" class="drop-overlay hidden">Drop to animate with local H3</div>
-  <script src="/static/app.js?v=105"></script>
+  <script src="/static/app.js?v=106"></script>
 </body>
 </html>

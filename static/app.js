@@ -721,6 +721,7 @@
     el.innerHTML = "";
     [
       { id: "all", label: "All" },
+      { id: "videos", label: "Videos" },
       { id: "starred", label: "Starred" },
       { id: "spicy", label: "Spicy" },
       { id: "normal", label: "Normal" },
@@ -743,6 +744,7 @@
 
   function filteredGalleryItems() {
     return (galleryItems || []).filter((it) => {
+      if (galleryFilter === "videos") return it.kind === "video";
       if (galleryFilter === "starred") return !!it.starred;
       if (galleryFilter === "spicy") return !!(it.spicy || it.nsfw);
       if (galleryFilter === "normal") return !(it.spicy || it.nsfw);
@@ -1138,15 +1140,209 @@
     const prev = $("galleryPagePrev");
     const next = $("galleryPageNext");
     if (prev) prev.addEventListener("click", () => {
-      galleryPage -= 1;
-      paintGallery();
-      scrollGalleryToTop();
+      turnGalleryPage(-1);
     });
     if (next) next.addEventListener("click", () => {
-      galleryPage += 1;
+      turnGalleryPage(1);
+    });
+    bindGallerySwipe();
+  }
+
+  let isPageTurning = false;
+  function turnGalleryPage(delta, animated = true) {
+    if (isPageTurning) return;
+    const items = filteredGalleryItems();
+    const win = pageWindow(items.length, galleryPage);
+    const targetPage = win.current + delta;
+    if (targetPage < 1 || targetPage > win.pages || targetPage === win.current) {
+      return;
+    }
+    if (!animated) {
+      galleryPage = targetPage;
       paintGallery();
       scrollGalleryToTop();
+      return;
+    }
+    const track = $("galleryTrack");
+    if (!track) {
+      galleryPage = targetPage;
+      paintGallery();
+      scrollGalleryToTop();
+      return;
+    }
+    isPageTurning = true;
+    const direction = delta > 0 ? -1 : 1;
+    track.classList.add("swiping");
+    track.style.transform = `translate3d(${direction * 38}px, 0, 0)`;
+    track.style.opacity = "0.2";
+    setTimeout(() => {
+      galleryPage = targetPage;
+      paintGallery();
+      scrollGalleryToTop();
+      track.classList.remove("swiping");
+      track.style.transform = `translate3d(${-direction * 38}px, 0, 0)`;
+      track.style.opacity = "0.2";
+      void track.offsetWidth; // force reflow
+      track.classList.add("swiping");
+      track.style.transform = "translate3d(0, 0, 0)";
+      track.style.opacity = "1";
+      setTimeout(() => {
+        track.classList.remove("swiping");
+        track.style.transform = "";
+        track.style.opacity = "";
+        isPageTurning = false;
+      }, 230);
+    }, 120);
+  }
+
+  function bindGallerySwipe() {
+    const vp = $("galleryViewport");
+    const track = $("galleryTrack");
+    if (!vp || !track) return;
+
+    let startX = 0;
+    let startY = 0;
+    let curX = 0;
+    let curY = 0;
+    let isTracking = false;
+    let isHorizontal = false;
+    let isDecided = false;
+
+    function resetDrag() {
+      isTracking = false;
+      isHorizontal = false;
+      isDecided = false;
+      vp.classList.remove("is-dragging");
+      track.classList.add("swiping");
+      track.style.transform = "translate3d(0, 0, 0)";
+      track.style.opacity = "1";
+      setTimeout(() => {
+        track.classList.remove("swiping");
+        track.style.transform = "";
+        track.style.opacity = "";
+      }, 230);
+    }
+
+    vp.addEventListener("pointerdown", (e) => {
+      if (selectMode || isPageTurning) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      if (e.target.closest("button") || e.target.closest("a") || e.target.closest(".del") || e.target.closest(".star")) return;
+
+      const items = filteredGalleryItems();
+      const win = pageWindow(items.length, galleryPage);
+      if (win.pages <= 1) return;
+
+      isTracking = true;
+      isHorizontal = false;
+      isDecided = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      curX = e.clientX;
+      curY = e.clientY;
+      track.classList.remove("swiping");
     });
+
+    window.addEventListener("pointermove", (e) => {
+      if (!isTracking) return;
+      curX = e.clientX;
+      curY = e.clientY;
+      const dx = curX - startX;
+      const dy = curY - startY;
+
+      if (!isDecided) {
+        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+          isDecided = true;
+          if (Math.abs(dx) > Math.abs(dy) * 1.25) {
+            isHorizontal = true;
+            vp.classList.add("is-dragging");
+            try { vp.setPointerCapture(e.pointerId); } catch (_) {}
+          } else {
+            isTracking = false;
+            return;
+          }
+        }
+      }
+
+      if (isHorizontal) {
+        if (e.cancelable) e.preventDefault();
+        const items = filteredGalleryItems();
+        const win = pageWindow(items.length, galleryPage);
+        let dampDx = dx;
+        if ((win.current <= 1 && dx > 0) || (win.current >= win.pages && dx < 0)) {
+          dampDx = dx * 0.25;
+        }
+        track.style.transform = `translate3d(${dampDx}px, 0, 0)`;
+        const op = Math.max(0.4, 1 - (Math.abs(dampDx) / 400));
+        track.style.opacity = String(op);
+      }
+    }, { passive: false });
+
+    function finishDrag(e) {
+      if (!isTracking) return;
+      if (!isHorizontal) {
+        isTracking = false;
+        return;
+      }
+      const dx = curX - startX;
+      const items = filteredGalleryItems();
+      const win = pageWindow(items.length, galleryPage);
+      const threshold = 48;
+
+      if (dx < -threshold && win.current < win.pages) {
+        // Drag left -> Next page
+        vp.classList.remove("is-dragging");
+        isTracking = false;
+        track.classList.add("swiping");
+        track.style.transform = `translate3d(-100px, 0, 0)`;
+        track.style.opacity = "0.2";
+        setTimeout(() => {
+          galleryPage = win.current + 1;
+          paintGallery();
+          scrollGalleryToTop();
+          track.classList.remove("swiping");
+          track.style.transform = "translate3d(60px, 0, 0)";
+          track.style.opacity = "0.2";
+          void track.offsetWidth;
+          track.classList.add("swiping");
+          track.style.transform = "translate3d(0, 0, 0)";
+          track.style.opacity = "1";
+          setTimeout(() => {
+            track.classList.remove("swiping");
+            track.style.transform = "";
+            track.style.opacity = "";
+          }, 230);
+        }, 120);
+      } else if (dx > threshold && win.current > 1) {
+        // Drag right -> Prev page
+        vp.classList.remove("is-dragging");
+        isTracking = false;
+        track.classList.add("swiping");
+        track.style.transform = `translate3d(100px, 0, 0)`;
+        track.style.opacity = "0.2";
+        setTimeout(() => {
+          galleryPage = win.current - 1;
+          paintGallery();
+          scrollGalleryToTop();
+          track.classList.remove("swiping");
+          track.style.transform = "translate3d(-60px, 0, 0)";
+          track.style.opacity = "0.2";
+          void track.offsetWidth;
+          track.classList.add("swiping");
+          track.style.transform = "translate3d(0, 0, 0)";
+          track.style.opacity = "1";
+          setTimeout(() => {
+            track.classList.remove("swiping");
+            track.style.transform = "";
+            track.style.opacity = "";
+          }, 230);
+        }, 120);
+      } else {
+        resetDrag();
+      }
+    }
+
+    window.addEventListener("pointerup", finishDrag);
+    window.addEventListener("pointercancel", resetDrag);
   }
 
   function paintGallery() {
