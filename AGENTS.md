@@ -49,7 +49,7 @@ export IMAGINE_PIN="choose-a-pin"          # unset default in code and scripts i
 
 Ports: portal `7860`, worker `7861`. The worker binds to localhost only. The portal is the public surface.
 
-Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=108` and `styles.css?v=107`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
+Static files are read from disk. A CSS or JS edit shows up without a restart, after the cache-bust query changes. `index.html` loads `app.js?v=109` and `styles.css?v=108`. Bump the query on the file you edit. Python route or status-field changes need a portal restart. `worker.py` is bind-mounted read-only; a worker change needs `./run_worker.sh`, which recreates the container and reloads the model. That takes minutes. Do not restart the worker while a still is running.
 
 `python-multipart` is required. Uploads fail without it.
 
@@ -85,7 +85,7 @@ Style chips: None, Cinematic, Anime, Photo, Watercolor, Sketch, 3D. The id is th
 
 Animate chips: durations `5`, `6`, `10` (default 5) and resolutions `fast`, `768p` (default `fast`). Stored in `imagine_h3_duration` and `imagine_h3_resolution`.
 
-Other localStorage keys: `imagine_pin`, `imagine_spicy`, `imagine_nsfw_blur` (default on), `imagine_rgba`, `imagine_framing` (default on), `imagine_strength` (default 0.65), `imagine_gallery_filter`, `imagine_page_size` (default 30, clamp 1–200), `imagine_status_ms` (500, 1000, 1500, 2000, 2500, 3000; default 500).
+Other localStorage keys: `imagine_pin`, `imagine_spicy`, `imagine_nsfw_blur` (default on), `imagine_rgba`, `imagine_framing` (default on), `imagine_strength` (default 0.65), `imagine_gallery_filter`, `imagine_page_size` (default 30, clamp 1–200), `imagine_gallery_cols` (`4`, `10`, `15`, or `20`; missing means the responsive grid), `imagine_status_ms` (500, 1000, 1500, 2000, 2500, 3000; default 500).
 
 ### Portal routes
 
@@ -146,7 +146,9 @@ Filters: All, Videos, Starred, Spicy, Normal. Changing the filter returns to pag
 
 Paging is client-side. One page size for the gallery and the Videos filter, stored in `imagine_page_size` (default 30, clamp 1–200). The control is one horizontal rail, hidden when that list has a single page. Dots sit evenly along the line, one per page. Drag the rail or click a dot to open that page. Arrow keys move one page when the rail is focused.
 
-Select mode: a click toggles one id and sets `selectAnchorId`. Shift-click adds every id in `filteredGalleryItems()` between the anchor and the target, inclusive, and skips ids already deleting. That range is the full filtered list, including items on other pages. Image clicks do not open the sheet while selecting. Leaving Select, or a multi-delete, clears the anchor and the selection. While selecting, `.gallery.select-mode` uses `repeat(auto-fill, minmax(92px, 1fr))`, hides stars, and shows `.sel-check`.
+`#galleryCols` sets how many thumbnails sit on a row. The choices are Auto, 4, 10, 15, and 20. Auto is the responsive grid (2 columns, 3 from 720px, and `minmax(210px, 1fr)` when compose is collapsed). A number sets `--gallery-cols` and `data-cols` on `#gallery`, including the Videos filter and select mode. The value is `imagine_gallery_cols`. Tiles under 96px use smaller corner buttons. Tiles under 40px hide the star and the delete button. The sheet and Select still delete those tiles.
+
+Select mode: a click toggles one id and sets `selectAnchorId`. Shift-click adds every id in `filteredGalleryItems()` between the anchor and the target, inclusive, and skips ids already deleting. That range is the full filtered list, including items on other pages. Image clicks do not open the sheet while selecting. Leaving Select, or a multi-delete, clears the anchor and the selection. While selecting, `.gallery.select-mode` without `data-cols` uses `repeat(auto-fill, minmax(92px, 1fr))`, hides stars, and shows `.sel-check`. A chosen per-row count keeps that column count in select mode.
 
 Delete marks the card (`.deleting`, `.del-state`, then `.deleting-out`) and calls `DELETE /api/gallery/{id}` or `POST /api/gallery/delete`. A failure puts the card back. `removedIds` stops an in-flight `loadGallery` from restoring a card that just disappeared.
 

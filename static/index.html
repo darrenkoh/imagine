@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#07070b" />
   <title>Imagine</title>
-  <link rel="stylesheet" href="/static/styles.css?v=107" />
+  <link rel="stylesheet" href="/static/styles.css?v=108" />
 </head>
 <body>
   <div id="gate">
@@ -156,7 +156,19 @@
             <button class="btn btn-ghost" id="refreshGallery" style="min-height:40px;font-size:14px">Refresh</button>
           </div>
         </div>
-        <div class="chips gallery-filters" id="galleryFilters"></div>
+        <div class="gallery-bar">
+          <div class="chips gallery-filters" id="galleryFilters"></div>
+          <label class="thumb-cols" title="Thumbnails on each row. The Videos filter uses the same size.">
+            <span>per row</span>
+            <select id="galleryCols" aria-label="Thumbnails per row">
+              <option value="">Auto</option>
+              <option value="4">4</option>
+              <option value="10">10</option>
+              <option value="15">15</option>
+              <option value="20">20</option>
+            </select>
+          </label>
+        </div>
         <div class="pager hidden" id="galleryPager">
           <div class="page-rail" id="galleryPageRail" role="slider" tabindex="0"
                aria-label="Gallery pages" aria-orientation="horizontal"
@@ -225,6 +237,6 @@
   </footer>
 
   <div id="dropOverlay" class="drop-overlay hidden">Drop to animate with local H3</div>
-  <script src="/static/app.js?v=108"></script>
+  <script src="/static/app.js?v=109"></script>
 </body>
 </html>

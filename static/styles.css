@@ -286,23 +286,31 @@ textarea { min-height: 96px; resize: vertical; line-height: 1.4; }
 .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .actions .btn { flex: 1; }
 .gallery {
-  display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
 }
 @media (min-width: 720px) {
-  .gallery { grid-template-columns: repeat(3, 1fr); }
+  .gallery:not([data-cols]) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .layout { display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px; align-items: start; }
   .layout.compose-collapsed {
     grid-template-columns: 1fr;
   }
-  .layout.compose-collapsed .gallery:not(.select-mode) {
+  .layout.compose-collapsed .gallery:not(.select-mode):not([data-cols]) {
     grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   }
 }
+.gallery[data-cols] {
+  grid-template-columns: repeat(var(--gallery-cols), minmax(0, 1fr));
+}
+.gallery[data-cols="4"] { gap: 10px; }
+.gallery[data-cols="10"] { gap: 6px; }
+.gallery[data-cols="15"] { gap: 4px; }
+.gallery[data-cols="20"] { gap: 3px; }
 .gitem {
   position: relative;
   border-radius: 12px;
   overflow: hidden;
   isolation: isolate;
+  container-type: inline-size;
   border: 1px solid var(--border);
   background: #000;
   aspect-ratio: 1;
@@ -883,7 +891,54 @@ input[type="file"] {
 .gen-row .btn-primary { flex:1; }
 .strength-label, .hint { font-size:13px; color:var(--muted,#9aa); margin:8px 0 4px; }
 #strength { width:100%; }
-.gallery-filters { margin:0 0 10px; }
+.gallery-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.gallery-filters { margin: 0; flex: 1 1 220px; }
+.thumb-cols {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin: 0;
+  min-height: 40px;
+  padding: 0 8px 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.thumb-cols select {
+  width: auto;
+  min-width: 4.5em;
+  height: 32px;
+  min-height: 0;
+  margin: 0;
+  padding: 0 16px 0 2px;
+  border: 0;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%239a9aad' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 2px center;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
 .gallery-empty { text-align:center; color:var(--muted,#9aa); padding:28px 12px; font-size:14px; }
 .gitem .star {
   position:absolute; left:6px; top:6px; z-index:2;
@@ -908,14 +963,58 @@ input[type="file"] {
   background:#6ea8fe;
   border-color:#6ea8fe;
 }
-.gallery.select-mode {
+.gallery.select-mode:not([data-cols]) {
   grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
   gap: 6px;
+}
+.gallery.select-mode {
   user-select: none;
   -webkit-user-select: none;
 }
+.gallery.select-mode[data-cols] {
+  grid-template-columns: repeat(var(--gallery-cols), minmax(0, 1fr));
+}
 .gallery.select-mode .gitem { border-radius: 8px; }
+.gallery[data-cols="15"] .gitem { border-radius: 6px; }
+.gallery[data-cols="20"] .gitem { border-radius: 4px; }
 .gallery.select-mode .gitem .star { display: none; }
+@container (max-width: 96px) {
+  .gitem button.del,
+  .gitem .star {
+    width: 18px;
+    height: 18px;
+    font-size: 12px;
+    top: 2px;
+  }
+  .gitem button.del { right: 2px; }
+  .gitem .star { left: 2px; }
+  .gitem .play-badge {
+    width: 16px;
+    height: 16px;
+    left: 3px;
+    bottom: 3px;
+    font-size: 9px;
+  }
+}
+@container (max-width: 40px) {
+  .gitem button.del,
+  .gitem .star { display: none; }
+  .gitem .play-badge {
+    width: 12px;
+    height: 12px;
+    left: 2px;
+    bottom: 2px;
+    font-size: 8px;
+  }
+  .gitem .sel-check {
+    width: 14px;
+    height: 14px;
+    font-size: 10px;
+    border-width: 1px;
+  }
+  .gitem .del-state { font-size: 0; gap: 0; }
+  .gitem .del-spin { width: 12px; height: 12px; }
+}
 .pager {
   margin: 0 0 6px;
 }

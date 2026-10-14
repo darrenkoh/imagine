@@ -44,6 +44,9 @@
   const PAGE_SIZE_KEY = "imagine_page_size";
   const PAGE_SIZE_DEFAULT = 30;
   let pageSize = readPageSize();
+  const GALLERY_COLS_KEY = "imagine_gallery_cols";
+  const GALLERY_COLS = [4, 10, 15, 20];
+  let galleryCols = readGalleryCols();
   const STATUS_RATE_KEY = "imagine_status_ms";
   const STATUS_RATES = [500, 1000, 1500, 2000, 2500, 3000];
   const STATUS_RATE_DEFAULT = 500;
@@ -1064,6 +1067,41 @@
     return PAGE_SIZE_DEFAULT;
   }
 
+  function readGalleryCols() {
+    try {
+      const n = Number(localStorage.getItem(GALLERY_COLS_KEY));
+      if (GALLERY_COLS.includes(n)) return n;
+    } catch (_) {}
+    return null;
+  }
+
+  function applyGalleryCols() {
+    const g = $("gallery");
+    if (!g) return;
+    if (galleryCols) {
+      g.dataset.cols = String(galleryCols);
+      g.style.setProperty("--gallery-cols", String(galleryCols));
+    } else {
+      delete g.dataset.cols;
+      g.style.removeProperty("--gallery-cols");
+    }
+  }
+
+  function bindGalleryCols() {
+    const sel = $("galleryCols");
+    if (!sel) return;
+    sel.value = galleryCols ? String(galleryCols) : "";
+    sel.addEventListener("change", () => {
+      const n = Number(sel.value);
+      galleryCols = GALLERY_COLS.includes(n) ? n : null;
+      try {
+        if (galleryCols) localStorage.setItem(GALLERY_COLS_KEY, String(galleryCols));
+        else localStorage.removeItem(GALLERY_COLS_KEY);
+      } catch (_) {}
+      applyGalleryCols();
+    });
+  }
+
   function pageWindow(total, page) {
     const count = Math.max(0, Math.trunc(Number(total)) || 0);
     const pages = Math.max(1, Math.ceil(count / pageSize));
@@ -1418,6 +1456,7 @@
   function paintGallery() {
     const g = $("gallery");
     if (!g) return;
+    applyGalleryCols();
     g.classList.toggle("select-mode", selectMode);
     const items = filteredGalleryItems();
     const page = syncPager("gallery", items.length, galleryPage);
@@ -2142,6 +2181,8 @@
     };
   }
   renderGalleryFilters();
+  bindGalleryCols();
+  applyGalleryCols();
 
   restartStatusLoop();
 })();
