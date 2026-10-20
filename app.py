@@ -229,8 +229,8 @@ def _queue_stats(job_id: str, job: dict) -> dict:
     my_t = float(job.get("created_at") or job.get("updated_at") or 0)
     kind = _job_kind(job)
     ahead = 0
-    # average elapsed from recent done jobs for ETA
-    dones: list[float] = []
+    # Collect (created_at, elapsed_s) from done jobs of the same kind
+    dones: list[tuple[float, float]] = []
     for p in JOBS.glob("*.json"):
         try:
             o = json.loads(p.read_text())
@@ -245,14 +245,16 @@ def _queue_stats(job_id: str, job: dict) -> dict:
                 ahead += 1
         elif st == "done":
             el = o.get("elapsed_s")
+            ct = float(o.get("created_at") or o.get("updated_at") or 0)
             if isinstance(el, (int, float)) and el > 0:
-                dones.append(float(el))
+                dones.append((ct, float(el)))
     out: dict = {"queue_ahead": ahead}
     if dones:
-        dones.sort()
-        # median of last up to 8
-        sample = dones[-8:]
-        mid = sample[len(sample) // 2]
+        # Sort by completion/creation timestamp so we sample the 8 most recent
+        dones.sort(key=lambda x: x[0])
+        recent_durations = [el for _, el in dones[-8:]]
+        recent_durations.sort()
+        mid = recent_durations[len(recent_durations) // 2]
         out["eta_s"] = round(mid * (ahead + 1), 1)
     return out
 
@@ -310,38 +312,51 @@ def _strip_frame(prompt: str) -> str:
     return p
 
 
+_history_lock = threading.Lock()
+
+
 def _read_history() -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
-    try:
-        data = json.loads(HISTORY_FILE.read_text())
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    with _history_lock:
+        try:
+            data = json.loads(HISTORY_FILE.read_text())
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
 
 def _write_history(items: list[dict]) -> None:
-    tmp = HISTORY_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(items, indent=2))
-    tmp.replace(HISTORY_FILE)
+    with _history_lock:
+        tmp = HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, indent=2))
+        tmp.replace(HISTORY_FILE)
 
 
-def _history_add(user_prompt: str, negative_prompt: str = "", *, width: int | None = None, height: int | None = None) -> dict:
-    """Prepend a prompt history entry. Dedupes identical prompt text (moves to top)."""
+def _history_add(user_prompt: str, negative_prompt: str = "", *, width: int | None = None, height: int | None = None, style: str | None = None) -> dict:
+    """Prepend a prompt history entry. Dedupes identical prompt text (moves to top). Preserves pinned."""
     text = (user_prompt or "").strip()
     if not text:
         return {}
     items = _read_history()
+    existing = next((it for it in items if (it.get("prompt") or "").strip() == text), None)
+    was_pinned = bool(existing.get("pinned")) if existing else False
     items = [it for it in items if (it.get("prompt") or "").strip() != text]
     entry = {
-        "id": uuid.uuid4().hex[:12],
+        "id": existing.get("id") if existing else uuid.uuid4().hex[:12],
         "prompt": text,
         "negative_prompt": (negative_prompt or "").strip(),
         "width": width,
         "height": height,
+        "style": style,
         "created_at": time.time(),
+        "pinned": was_pinned,
     }
-    items.insert(0, entry)
+    insert_idx = 0
+    if not was_pinned:
+        while insert_idx < len(items) and items[insert_idx].get("pinned"):
+            insert_idx += 1
+    items.insert(insert_idx, entry)
     items = items[:200]
     _write_history(items)
     return entry
@@ -389,24 +404,31 @@ _cpu_prev: tuple[float, float] | None = None  # (idle, total)
 
 
 def _cpu_percent() -> Optional[float]:
-    """Non-blocking CPU % from /proc/stat deltas between calls."""
+    """Non-blocking CPU % from /proc/stat deltas (Linux) or loadavg (macOS)."""
     global _cpu_prev
     try:
-        line = Path("/proc/stat").read_text().splitlines()[0]
-        parts = line.split()
-        # cpu user nice system idle iowait irq softirq steal ...
-        nums = [float(x) for x in parts[1:8]]
-        idle = nums[3] + nums[4]  # idle + iowait
-        total = sum(nums)
-        if _cpu_prev is None:
+        proc_stat = Path("/proc/stat")
+        if proc_stat.exists():
+            line = proc_stat.read_text().splitlines()[0]
+            parts = line.split()
+            # cpu user nice system idle iowait irq softirq steal ...
+            nums = [float(x) for x in parts[1:8]]
+            idle = nums[3] + nums[4]  # idle + iowait
+            total = sum(nums)
+            if _cpu_prev is None:
+                _cpu_prev = (idle, total)
+                return None
+            idle0, total0 = _cpu_prev
             _cpu_prev = (idle, total)
-            return None
-        idle0, total0 = _cpu_prev
-        _cpu_prev = (idle, total)
-        dt = total - total0
-        if dt <= 0:
-            return None
-        return round(max(0.0, min(100.0, 100.0 * (1.0 - (idle - idle0) / dt))), 1)
+            dt = total - total0
+            if dt <= 0:
+                return None
+            return round(max(0.0, min(100.0, 100.0 * (1.0 - (idle - idle0) / dt))), 1)
+        if os.uname().sysname == "Darwin":
+            cpus = os.cpu_count() or 1
+            load1 = os.getloadavg()[0]
+            return round(max(0.0, min(100.0, (load1 / cpus) * 100.0)), 1)
+        return None
     except Exception:
         return None
 
@@ -423,8 +445,15 @@ def _gpu_temp_c() -> Optional[float]:
     return temp
 
 
+_gpu_cache: tuple[float, tuple[Optional[float], Optional[float]]] = (0.0, (None, None))
+
+
 def _gpu_stats() -> tuple[Optional[float], Optional[float]]:
-    """Return (util %, temp °C) from one nvidia-smi call."""
+    """Return (util %, temp °C) from one nvidia-smi call with 0.8s TTL cache."""
+    global _gpu_cache
+    now = time.monotonic()
+    if now - _gpu_cache[0] < 0.8:
+        return _gpu_cache[1]
     try:
         r = subprocess.run(
             [
@@ -437,6 +466,7 @@ def _gpu_stats() -> tuple[Optional[float], Optional[float]]:
             timeout=2,
         )
         if r.returncode != 0:
+            _gpu_cache = (now, (None, None))
             return None, None
         line = (r.stdout or "").strip().splitlines()[0].strip()
         parts = [p.strip() for p in line.split(",")]
@@ -445,8 +475,11 @@ def _gpu_stats() -> tuple[Optional[float], Optional[float]]:
             util = round(float(parts[0]), 1)
         if len(parts) > 1 and parts[1] and "N/A" not in parts[1].upper():
             temp = round(float(parts[1]), 1)
-        return util, temp
+        res = (util, temp)
+        _gpu_cache = (now, res)
+        return res
     except Exception:
+        _gpu_cache = (now, (None, None))
         return None, None
 
 
@@ -472,14 +505,42 @@ def _cpu_temp_c() -> Optional[float]:
 def _meminfo() -> dict:
     out: dict[str, Any] = {"mem_total_gb": None, "mem_available_gb": None, "mem_free_gb": None}
     try:
-        info: dict[str, int] = {}
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].endswith(":"):
-                info[parts[0][:-1]] = int(parts[1])  # kB
-        out["mem_total_gb"] = round(info.get("MemTotal", 0) / 1024 / 1024, 1)
-        out["mem_available_gb"] = round(info.get("MemAvailable", 0) / 1024 / 1024, 1)
-        out["mem_free_gb"] = round(info.get("MemFree", 0) / 1024 / 1024, 1)
+        proc_mem = Path("/proc/meminfo")
+        if proc_mem.exists():
+            info: dict[str, int] = {}
+            for line in proc_mem.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    info[parts[0][:-1]] = int(parts[1])  # kB
+            out["mem_total_gb"] = round(info.get("MemTotal", 0) / 1024 / 1024, 1)
+            out["mem_available_gb"] = round(info.get("MemAvailable", 0) / 1024 / 1024, 1)
+            out["mem_free_gb"] = round(info.get("MemFree", 0) / 1024 / 1024, 1)
+            return out
+        if os.uname().sysname == "Darwin":
+            if _RAM_GB is not None:
+                out["mem_total_gb"] = round(_RAM_GB, 1)
+            r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                lines = r.stdout.splitlines()
+                page_size = 4096
+                m = re.search(r"page size of (\d+) bytes", lines[0] if lines else "")
+                if m:
+                    page_size = int(m.group(1))
+                stats: dict[str, int] = {}
+                for line in lines[1:]:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        val = v.strip().rstrip(".")
+                        if val.isdigit():
+                            stats[k.strip()] = int(val)
+                free_pages = stats.get("Pages free", 0)
+                inactive_pages = stats.get("Pages inactive", 0)
+                purgeable_pages = stats.get("Pages purgeable", 0)
+                speculative_pages = stats.get("Pages speculative", 0)
+                free_bytes = free_pages * page_size
+                avail_bytes = (free_pages + inactive_pages + purgeable_pages + speculative_pages) * page_size
+                out["mem_free_gb"] = round(free_bytes / (1024 ** 3), 1)
+                out["mem_available_gb"] = round(avail_bytes / (1024 ** 3), 1)
     except Exception as e:
         out["error"] = str(e)
     return out
@@ -601,18 +662,29 @@ def _net_bandwidth() -> dict:
         return empty
 
 
+_docker_cache: dict[str, tuple[float, Optional[bool]]] = {}
+
+
 def _docker_running(name: str) -> Optional[bool]:
+    global _docker_cache
+    now = time.monotonic()
+    if name in _docker_cache and (now - _docker_cache[name][0] < 2.0):
+        return _docker_cache[name][1]
     try:
         r = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", name],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=2,
         )
         if r.returncode != 0:
-            return False
-        return r.stdout.strip().lower() == "true"
+            res = False
+        else:
+            res = r.stdout.strip().lower() == "true"
+        _docker_cache[name] = (now, res)
+        return res
     except Exception:
+        _docker_cache[name] = (now, None)
         return None
 
 
@@ -715,13 +787,36 @@ def _footer_model(worker: dict, h3_running: Optional[bool]) -> tuple[str, str]:
     return "No model", "down"
 
 
+def _active_job() -> Optional[dict]:
+    active = []
+    for p in JOBS.glob("*.json"):
+        try:
+            j = json.loads(p.read_text())
+            if j.get("status") in ("queued", "running"):
+                active.append((float(j.get("updated_at") or j.get("created_at") or 0), j))
+        except Exception:
+            continue
+    if not active:
+        return None
+    active.sort(key=lambda x: x[0], reverse=True)
+    j = active[0][1]
+    return {"id": j.get("id"), "kind": _job_kind(j), "status": j.get("status")}
+
+
 @app.get("/api/status")
 async def status(request: Request) -> dict:
     # Soft gate: allow unauthenticated status but omit pin confirmation
     wh = await _worker_health()
-    h3_ok, h3_detail = _h3_ready()
-    h3_running = _docker_running("vllm-minimax-h3")
+    h3_ok, h3_detail = await asyncio.to_thread(_h3_ready)
+    h3_running = await asyncio.to_thread(_docker_running, "vllm-minimax-h3")
+    worker_running = await asyncio.to_thread(_docker_running, "imagine-qwen-worker")
     model_label, model_state = _footer_model(wh, h3_running)
+    gpu_util, gpu_temp = await asyncio.to_thread(_gpu_stats)
+    cpu_pct = await asyncio.to_thread(_cpu_percent)
+    cpu_temp = await asyncio.to_thread(_cpu_temp_c)
+    mem = await asyncio.to_thread(_meminfo)
+    net = await asyncio.to_thread(_net_bandwidth)
+    active_job = await asyncio.to_thread(_active_job)
     return {
         "ok": True,
         "time": time.time(),
@@ -731,13 +826,14 @@ async def status(request: Request) -> dict:
         "model_state": model_state,
         "h3_video": h3_ok,
         "h3_detail": h3_detail,
-        "worker_container": _docker_running("imagine-qwen-worker"),
-        "memory": _meminfo(),
-        "cpu_percent": _cpu_percent(),
-        "gpu_percent": _gpu_percent(),
-        "gpu_temp_c": _gpu_temp_c(),
-        "cpu_temp_c": _cpu_temp_c(),
-        "net": _net_bandwidth(),
+        "worker_container": worker_running,
+        "memory": mem,
+        "cpu_percent": cpu_pct,
+        "gpu_percent": gpu_util,
+        "gpu_temp_c": gpu_temp,
+        "cpu_temp_c": cpu_temp,
+        "net": net,
+        "active_job": active_job,
         "pin_ok": request.cookies.get(COOKIE) == PIN
         or request.headers.get("X-Imagine-Pin") == PIN,
     }
@@ -764,6 +860,13 @@ async def api_upload(file: UploadFile = File(...), _: None = Depends(_check_pin)
     # Keep alpha if present
     dest = UPLOADS / f"{uid}.png"
     im.save(dest, format="PNG")
+    meta = {}
+    source_dict = getattr(im, "text", None) or getattr(im, "info", None) or {}
+    if isinstance(source_dict, dict):
+        for k in ("prompt", "user_prompt", "negative_prompt", "seed", "steps", "style", "width", "height"):
+            if k in source_dict and source_dict[k]:
+                val = source_dict[k]
+                meta[k] = val if isinstance(val, str) else str(val)
     return {
         "id": uid,
         "path": f"uploads/{uid}.png",
@@ -771,6 +874,7 @@ async def api_upload(file: UploadFile = File(...), _: None = Depends(_check_pin)
         "width": im.width,
         "height": im.height,
         "mode": im.mode,
+        "meta": meta,
     }
 
 
@@ -784,6 +888,33 @@ def api_upload_get(name: str, _: None = Depends(_check_pin)):
     return FileResponse(path, media_type="image/png")
 
 
+@app.post("/api/uploads/from-image/{job_id}")
+def api_upload_from_image(job_id: str, _: None = Depends(_check_pin)) -> dict:
+    safe = _safe_upload_id(job_id)
+    if not safe:
+        raise HTTPException(400, "bad image id")
+    src = IMAGES / f"{safe}.png"
+    if not src.exists():
+        raise HTTPException(404, "image not found")
+    dest = UPLOADS / f"{safe}.png"
+    if not dest.exists() or dest.resolve() != src.resolve():
+        shutil.copy2(src, dest)
+    from PIL import Image
+    try:
+        with Image.open(dest) as im:
+            w, h, mode = im.width, im.height, im.mode
+    except Exception:
+        w, h, mode = 1024, 1024, "RGB"
+    return {
+        "id": safe,
+        "path": f"uploads/{safe}.png",
+        "url": f"/api/uploads/{safe}.png",
+        "width": w,
+        "height": h,
+        "mode": mode,
+    }
+
+
 def _safe_upload_id(image_id: str) -> str:
     return "".join(c for c in (image_id or "") if c.isalnum())[:24]
 
@@ -794,18 +925,28 @@ def _h3_paths() -> tuple[Path, Path]:
     return binary, model
 
 
+_h3_cache: tuple[float, tuple[bool, str]] = (0.0, (False, ""))
+
+
 def _h3_ready() -> tuple[bool, str]:
     """Local h3.c binary plus MiniMax-H3 weights. No cloud key is involved."""
+    global _h3_cache
+    now = time.monotonic()
+    if now - _h3_cache[0] < 2.0:
+        return _h3_cache[1]
     binary, model = _h3_paths()
     if not binary.is_file():
-        return False, f"Local h3 binary not found at {binary}. Build it in ~/src/h3.c."
-    if not os.access(binary, os.X_OK):
-        return False, f"Local h3 binary is not executable: {binary}"
-    if not model.is_dir():
-        return False, f"MiniMax-H3 weights not found at {model}."
-    if not any(model.rglob("*.safetensors")):
-        return False, f"MiniMax-H3 weights are incomplete in {model}."
-    return True, ""
+        res = False, f"Local h3 binary not found at {binary}. Build it in ~/src/h3.c."
+    elif not os.access(binary, os.X_OK):
+        res = False, f"Local h3 binary is not executable: {binary}"
+    elif not model.is_dir():
+        res = False, f"MiniMax-H3 weights not found at {model}."
+    elif not any(model.rglob("*.safetensors")):
+        res = False, f"MiniMax-H3 weights are incomplete in {model}."
+    else:
+        res = True, ""
+    _h3_cache = (now, res)
+    return res
 
 
 def _ram_gb() -> Optional[float]:
@@ -1054,7 +1195,11 @@ async def api_animate(body: AnimateBody, _: None = Depends(_check_pin)) -> dict:
     safe = _safe_upload_id(body.image_id)
     src = UPLOADS / f"{safe}.png"
     if not safe or not src.exists():
-        raise HTTPException(400, "upload not found — drop the image again")
+        img_cand = IMAGES / f"{safe}.png"
+        if safe and img_cand.exists():
+            shutil.copy2(img_cand, src)
+        else:
+            raise HTTPException(400, "upload not found — drop the image again")
 
     user_prompt = (body.prompt or "").strip()
     motion = user_prompt or H3_DEFAULT_MOTION
@@ -1093,6 +1238,9 @@ async def api_animate(body: AnimateBody, _: None = Depends(_check_pin)) -> dict:
     return job
 
 
+_h3_lock = asyncio.Lock()
+
+
 async def _run_animate(
     job_id: str,
     src: Path,
@@ -1126,17 +1274,21 @@ async def _run_animate(
         if _cancelled():
             _touch(status="cancelled", error=None, pct=0)
             return
-        prepared = _fit_h3_still(src, resolution)
-        prepared.save(frame_path, format="PNG")
-        _touch(
-            width=prepared.width,
-            height=prepared.height,
-            status="running",
-            provider_status="starting",
-            pct=1,
-            layers=_h3_layers(),
-            steps=_h3_steps(),
-        )
+        async with _h3_lock:
+            if _cancelled():
+                _touch(status="cancelled", error=None, pct=0)
+                return
+            prepared = _fit_h3_still(src, resolution)
+            prepared.save(frame_path, format="PNG")
+            _touch(
+                width=prepared.width,
+                height=prepared.height,
+                status="running",
+                provider_status="starting",
+                pct=1,
+                layers=_h3_layers(),
+                steps=_h3_steps(),
+            )
         cmd = _h3_command(frame_path, dest, motion, duration, prepared.width, prepared.height)
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -1299,6 +1451,10 @@ def resolve_edit_path(image_id: Optional[str]) -> Optional[str]:
     safe = "".join(c for c in image_id if c.isalnum())[:24]
     cand = UPLOADS / f"{safe}.png"
     if not cand.exists():
+        img_cand = IMAGES / f"{safe}.png"
+        if safe and img_cand.exists():
+            shutil.copy2(img_cand, cand)
+            return f"uploads/{safe}.png"
         raise HTTPException(400, "upload not found — re-upload the image")
     return f"uploads/{safe}.png"
 
@@ -1328,7 +1484,7 @@ async def api_generate(body: GenerateBody, _: None = Depends(_check_pin)) -> dic
 
     # Save clean user prompt to history (not the framing suffix)
     try:
-        _history_add(styled["user_prompt"], body.negative_prompt or "", width=body.width, height=body.height)
+        _history_add(styled["user_prompt"], body.negative_prompt or "", width=body.width, height=body.height, style=body.style)
     except Exception:
         pass
 
@@ -1399,8 +1555,30 @@ async def _run_generate(job_id: str, payload: dict, fallback_seed: Optional[int]
         data = r.json()
         src = Path(data["path"])
         dest = IMAGES / f"{job_id}.png"
-        if src.resolve() != dest.resolve():
-            if src.exists():
+        from PIL import Image, PngImagePlugin
+        try:
+            input_file = src if src.exists() else dest
+            with Image.open(input_file) as im:
+                im.load()
+                png_info = PngImagePlugin.PngInfo()
+                if payload.get("prompt"):
+                    png_info.add_text("prompt", str(payload["prompt"]))
+                if job.get("user_prompt"):
+                    png_info.add_text("user_prompt", str(job["user_prompt"]))
+                if payload.get("negative_prompt"):
+                    png_info.add_text("negative_prompt", str(payload["negative_prompt"]))
+                seed_val = data.get("seed", fallback_seed)
+                if seed_val is not None:
+                    png_info.add_text("seed", str(seed_val))
+                if payload.get("steps") is not None:
+                    png_info.add_text("steps", str(payload["steps"]))
+                if payload.get("width"):
+                    png_info.add_text("width", str(payload["width"]))
+                if payload.get("height"):
+                    png_info.add_text("height", str(payload["height"]))
+                im.save(dest, format="PNG", pnginfo=png_info)
+        except Exception:
+            if src.resolve() != dest.resolve() and src.exists():
                 shutil.copy2(src, dest)
         job.update(
             {
@@ -1450,6 +1628,19 @@ def api_prompt_history_delete(item_id: str, _: None = Depends(_check_pin)) -> di
     return {"ok": True, "id": item_id}
 
 
+@app.post("/api/prompt-history/{item_id}/pin")
+def api_prompt_history_pin(item_id: str, _: None = Depends(_check_pin)) -> dict:
+    items = _read_history()
+    target = next((it for it in items if it.get("id") == item_id), None)
+    if not target:
+        raise HTTPException(404, "not found")
+    target["pinned"] = not bool(target.get("pinned"))
+    pinned_items = [it for it in items if it.get("pinned")]
+    unpinned_items = [it for it in items if not it.get("pinned")]
+    _write_history(pinned_items + unpinned_items)
+    return {"ok": True, "id": item_id, "pinned": target["pinned"]}
+
+
 @app.delete("/api/prompt-history")
 def api_prompt_history_clear(_: None = Depends(_check_pin)) -> dict:
     _write_history([])
@@ -1458,52 +1649,106 @@ def api_prompt_history_clear(_: None = Depends(_check_pin)) -> dict:
 
 
 @app.delete("/api/clear-all")
-def api_clear_all(_: None = Depends(_check_pin)) -> dict:
-    """Wipe prompt history, gallery images, jobs, and progress files."""
-    cleared = {"history": 0, "images": 0, "jobs": 0, "progress": 0}
-    # History
-    n_hist = len(_read_history())
-    _write_history([])
-    cleared["history"] = n_hist
+def api_clear_all(keep_starred: bool = True, _: None = Depends(_check_pin)) -> dict:
+    """Wipe prompt history, gallery images, jobs, uploads, and progress files. Keeps starred by default."""
+    cleared = {"history": 0, "images": 0, "jobs": 0, "progress": 0, "uploads": 0, "videos": 0, "thumbs": 0}
+    starred_ids: set[str] = set()
+    if keep_starred:
+        for p in JOBS.glob("*.json"):
+            try:
+                j = json.loads(p.read_text())
+                if j.get("starred") and j.get("id"):
+                    starred_ids.add(str(j["id"]))
+            except Exception:
+                continue
+
+    # History: keep pinned prompts if keep_starred
+    hist_items = _read_history()
+    if keep_starred:
+        kept_history = [it for it in hist_items if it.get("pinned")]
+        cleared["history"] = len(hist_items) - len(kept_history)
+        _write_history(kept_history)
+    else:
+        cleared["history"] = len(hist_items)
+        _write_history([])
+
     # Images
     for p in IMAGES.glob("*.png"):
+        if p.stem in starred_ids:
+            continue
         try:
             p.unlink()
             cleared["images"] += 1
         except Exception:
             pass
-    cleared["videos"] = 0
+
     for p in VIDEOS.glob("*.mp4"):
+        if p.stem in starred_ids:
+            continue
         try:
             p.unlink()
             cleared["videos"] += 1
         except Exception:
             pass
+
     # Jobs
     for p in JOBS.glob("*.json"):
+        if p.stem in starred_ids:
+            continue
         try:
             p.unlink()
             cleared["jobs"] += 1
         except Exception:
             pass
+
     # Progress
     for p in PROGRESS.glob("*.json"):
+        if p.stem in starred_ids:
+            continue
         try:
             p.unlink()
             cleared["progress"] += 1
         except Exception:
             pass
-    cleared["thumbs"] = 0
+    for p in PROGRESS.glob("*.cancel"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    # Uploads (do not delete uploads that are source image for a kept job)
+    starred_image_ids = set()
+    if keep_starred:
+        for sid in starred_ids:
+            try:
+                j = _read_job(sid)
+                if j.get("image_id"):
+                    starred_image_ids.add(str(j["image_id"]))
+            except Exception:
+                pass
+
+    for p in UPLOADS.glob("*.png"):
+        if p.stem in starred_image_ids:
+            continue
+        try:
+            p.unlink()
+            cleared["uploads"] += 1
+        except Exception:
+            pass
+
     for p in THUMBS.glob("*"):
         if p.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            continue
+        if p.stem in starred_ids:
             continue
         try:
             p.unlink()
             cleared["thumbs"] += 1
         except Exception:
             pass
+
     _bump_gallery()
-    return {"ok": True, "cleared": cleared}
+    return {"ok": True, "cleared": cleared, "kept_starred": len(starred_ids)}
 
 
 _NSFW_RE = re.compile(
@@ -1777,6 +2022,65 @@ async def api_gallery_delete_batch(request: Request, _: None = Depends(_check_pi
     return {"ok": True, "deleted": deleted}
 
 
+@app.post("/api/gallery/star-batch")
+async def api_gallery_star_batch(request: Request, _: None = Depends(_check_pin)) -> dict:
+    body = await request.json()
+    ids = body.get("ids") or []
+    starred_target = body.get("starred")
+    if starred_target is None:
+        has_unstarred = any(not bool(_read_job(str(jid)).get("starred")) for jid in ids)
+        starred_target = True if has_unstarred else False
+    updated = []
+    for job_id in ids:
+        safe = _safe_media_id(str(job_id))
+        if not safe:
+            continue
+        job = _read_job(safe)
+        job["starred"] = bool(starred_target)
+        job["updated_at"] = time.time()
+        _write_job(safe, job)
+        updated.append(safe)
+    _bump_gallery()
+    return {"ok": True, "ids": updated, "starred": bool(starred_target)}
+
+
+@app.post("/api/gallery/archive")
+async def api_gallery_archive(request: Request, _: None = Depends(_check_pin)):
+    import io
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    body = await request.json()
+    ids = body.get("ids") or []
+    if not ids:
+        raise HTTPException(400, "no ids provided")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        added = 0
+        for job_id in ids:
+            safe = _safe_media_id(str(job_id))
+            if not safe:
+                continue
+            img_path = IMAGES / f"{safe}.png"
+            vid_path = VIDEOS / f"{safe}.mp4"
+            if img_path.exists():
+                zf.write(img_path, arcname=f"{safe}.png")
+                added += 1
+            if vid_path.exists():
+                zf.write(vid_path, arcname=f"{safe}.mp4")
+                added += 1
+    if added == 0:
+        raise HTTPException(404, "no files found for given ids")
+    buf.seek(0)
+    filename = f"imagine-export-{int(time.time())}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True}
@@ -1798,12 +2102,34 @@ def _fail_orphaned_video_jobs() -> None:
         _write_job(str(job.get("id") or p.stem), job)
 
 
+def _fail_orphaned_image_jobs() -> None:
+    """A restart leaves image jobs stranded. Mark leftover queued/running image jobs as interrupted."""
+    now = time.time()
+    for p in JOBS.glob("*.json"):
+        try:
+            job = json.loads(p.read_text())
+        except Exception:
+            continue
+        if _job_kind(job) != "image":
+            continue
+        if job.get("status") not in ("queued", "running"):
+            continue
+        job["status"] = "error"
+        job["error"] = "interrupted — the portal restarted before image generation finished"
+        job["updated_at"] = now
+        _write_job(str(job.get("id") or p.stem), job)
+
+
 try:
     _seed_history_from_jobs()
 except Exception:
     pass
 try:
     _fail_orphaned_video_jobs()
+except Exception:
+    pass
+try:
+    _fail_orphaned_image_jobs()
 except Exception:
     pass
 

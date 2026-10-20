@@ -216,11 +216,11 @@ class TurboDefaultsTest(unittest.TestCase):
         self.assertIn("transformers>=5.17.0", launch)
         self.assertIn("sample_sigmas", launch)
         self.assertIn('if (it.kind !== "video" && it.image) return it.image;', js)
-        self.assertIn("styles.css?v=108", html)
+        self.assertIn("styles.css?v=110", html)
         self.assertIn('id="galleryPageRail"', html)
         self.assertNotIn("galleryPagePrev", html)
         self.assertNotIn("galleryPageSize", html)
-        self.assertIn("app.js?v=109", html)
+        self.assertIn("app.js?v=111", html)
 
     def test_still_gallery_thumb_uses_the_original_image(self) -> None:
         client = TestClient(app.app)
@@ -266,6 +266,108 @@ class TurboDefaultsTest(unittest.TestCase):
             ):
                 path.unlink(missing_ok=True)
             app._bump_gallery()
+
+    def test_batch_star_and_archive(self) -> None:
+        client = TestClient(app.app)
+        headers = {"X-Imagine-Pin": "haku"}
+        id1 = "batchtest01"
+        id2 = "batchtest02"
+        p1 = app.IMAGES / f"{id1}.png"
+        p2 = app.IMAGES / f"{id2}.png"
+        Image.new("RGB", (64, 64), (10, 20, 30)).save(p1)
+        Image.new("RGB", (64, 64), (40, 50, 60)).save(p2)
+        app._write_job(id1, {"id": id1, "status": "done", "prompt": "test 1", "starred": False})
+        app._write_job(id2, {"id": id2, "status": "done", "prompt": "test 2", "starred": False})
+        try:
+            # Batch star
+            star_res = client.post("/api/gallery/star-batch", headers=headers, json={"ids": [id1, id2], "starred": True})
+            self.assertEqual(star_res.status_code, 200)
+            self.assertTrue(star_res.json()["starred"])
+            self.assertTrue(app._read_job(id1).get("starred"))
+            self.assertTrue(app._read_job(id2).get("starred"))
+
+            # Batch archive zip
+            import io, zipfile
+            arch_res = client.post("/api/gallery/archive", headers=headers, json={"ids": [id1, id2]})
+            self.assertEqual(arch_res.status_code, 200)
+            self.assertEqual(arch_res.headers["content-type"], "application/zip")
+            with zipfile.ZipFile(io.BytesIO(arch_res.content), "r") as zf:
+                names = zf.namelist()
+                self.assertIn(f"{id1}.png", names)
+                self.assertIn(f"{id2}.png", names)
+        finally:
+            for p in (p1, p2, app.JOBS / f"{id1}.json", app.JOBS / f"{id2}.json"):
+                p.unlink(missing_ok=True)
+            app._bump_gallery()
+
+    def test_clear_all_keeps_starred_items(self) -> None:
+        client = TestClient(app.app)
+        headers = {"X-Imagine-Pin": "haku"}
+        starred_id = "keepstar01"
+        unstarred_id = "dropunstar01"
+        p_star = app.IMAGES / f"{starred_id}.png"
+        p_unstar = app.IMAGES / f"{unstarred_id}.png"
+        Image.new("RGB", (64, 64), (10, 10, 10)).save(p_star)
+        Image.new("RGB", (64, 64), (20, 20, 20)).save(p_unstar)
+        app._write_job(starred_id, {"id": starred_id, "status": "done", "prompt": "keep me", "starred": True})
+        app._write_job(unstarred_id, {"id": unstarred_id, "status": "done", "prompt": "delete me", "starred": False})
+        try:
+            res = client.delete("/api/clear-all?keep_starred=true", headers=headers)
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(p_star.exists())
+            self.assertFalse(p_unstar.exists())
+            self.assertTrue((app.JOBS / f"{starred_id}.json").exists())
+            self.assertFalse((app.JOBS / f"{unstarred_id}.json").exists())
+        finally:
+            p_star.unlink(missing_ok=True)
+            p_unstar.unlink(missing_ok=True)
+            (app.JOBS / f"{starred_id}.json").unlink(missing_ok=True)
+            (app.JOBS / f"{unstarred_id}.json").unlink(missing_ok=True)
+            app._bump_gallery()
+
+    def test_prompt_history_pin_and_png_metadata(self) -> None:
+        client = TestClient(app.app)
+        headers = {"X-Imagine-Pin": "haku"}
+        # Add a prompt
+        entry = app._history_add("a cybernetic fox in neo-tokyo", "blurry")
+        self.assertIn("id", entry)
+        eid = entry["id"]
+
+        # Pin it
+        pin_res = client.post(f"/api/prompt-history/{eid}/pin", headers=headers)
+        self.assertEqual(pin_res.status_code, 200)
+        self.assertTrue(pin_res.json()["pinned"])
+
+        # History list has pinned item
+        items = client.get("/api/prompt-history", headers=headers).json()["items"]
+        pinned_item = next((it for it in items if it["id"] == eid), None)
+        self.assertIsNotNone(pinned_item)
+        self.assertTrue(pinned_item.get("pinned"))
+
+        # Test upload with PNG metadata round-trip
+        import io
+        from PIL import PngImagePlugin
+        buf = io.BytesIO()
+        meta = PngImagePlugin.PngInfo()
+        meta.add_text("prompt", "a cybernetic fox in neo-tokyo")
+        meta.add_text("user_prompt", "a cybernetic fox in neo-tokyo")
+        meta.add_text("seed", "42")
+        meta.add_text("steps", "8")
+        Image.new("RGB", (64, 64), (100, 150, 200)).save(buf, format="PNG", pnginfo=meta)
+        buf.seek(0)
+        up_res = client.post(
+            "/api/upload",
+            headers=headers,
+            files={"file": ("meta_test.png", buf.getvalue(), "image/png")},
+        )
+        self.assertEqual(up_res.status_code, 200)
+        data = up_res.json()
+        self.assertIn("meta", data)
+        self.assertEqual(data["meta"].get("user_prompt"), "a cybernetic fox in neo-tokyo")
+        self.assertEqual(data["meta"].get("seed"), "42")
+        self.assertEqual(data["meta"].get("steps"), "8")
+        # Clean up uploaded test file
+        (app.UPLOADS / f"{data['id']}.png").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

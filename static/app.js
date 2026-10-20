@@ -24,6 +24,7 @@
   let rgba = localStorage.getItem("imagine_rgba") === "1";
   // default ON (missing key => framed)
   let framing = localStorage.getItem("imagine_framing") !== "0";
+  let seedLocked = localStorage.getItem("imagine_seed_locked") === "1";
   let task = "create"; // create | edit | animate
   let editImageId = null;
   let animateImageId = null;
@@ -180,7 +181,25 @@
     renderFramingChips();
     renderRgbaChips();
     renderAnimateChips();
+    syncSeedLockUi();
     updateComposeSummary();
+  }
+
+  function syncSeedLockUi() {
+    const btn = $("lockSeed");
+    if (!btn) return;
+    btn.textContent = seedLocked ? "🔒" : "🔓";
+    btn.title = seedLocked ? "Seed locked (click to unlock)" : "Seed unlocked (click to lock)";
+    btn.classList.toggle("locked", seedLocked);
+  }
+
+  function toggleLockSeed() {
+    seedLocked = !seedLocked;
+    localStorage.setItem("imagine_seed_locked", seedLocked ? "1" : "0");
+    if (seedLocked && $("seed") && $("seed").value === "") {
+      $("seed").value = Math.floor(Math.random() * 2 ** 31);
+    }
+    syncSeedLockUi();
   }
 
 
@@ -270,6 +289,102 @@
     }
   }
 
+  function snapAspectToDimensions(w, h) {
+    if (!w || !h) return;
+    const r = w / h;
+    let best = ASPECTS[0];
+    let minDiff = Infinity;
+    for (const a of ASPECTS) {
+      const diff = Math.abs((a.w / a.h) - r);
+      if (diff < minDiff) {
+        minDiff = diff;
+        best = a;
+      }
+    }
+    aspect = best;
+    refreshChips();
+  }
+
+  function checkAndPromptMetadataRestore(meta) {
+    if (!meta) return;
+    const pText = (meta.user_prompt || meta.prompt || "").trim();
+    if (!pText) return;
+    if (confirm(`Restore prompt & settings from this image?\n\n"${pText}"`)) {
+      $("prompt").value = pText;
+      if (meta.negative_prompt != null && $("negative")) {
+        $("negative").value = meta.negative_prompt;
+      }
+      if (meta.seed != null && $("seed")) {
+        $("seed").value = meta.seed;
+        seedLocked = true;
+        localStorage.setItem("imagine_seed_locked", "1");
+        syncSeedLockUi();
+      }
+      if (meta.steps != null && $("steps")) {
+        $("steps").value = meta.steps;
+      }
+      if (meta.style != null) {
+        const matchedStyle = STYLES.find((s) => s.id === meta.style) || STYLES[0];
+        style = matchedStyle;
+      }
+      refreshChips();
+      autoGrowPrompt();
+      updateComposeSummary();
+    }
+  }
+
+  async function useEditFile(file) {
+    if (!file) return;
+    task = "edit";
+    setComposeExpanded(true, true);
+    refreshChips();
+    try {
+      const up = await uploadEditFile(file);
+      editImageId = up.id;
+      $("editPreview").src = up.url + "?t=" + Date.now();
+      $("editPreviewWrap").classList.remove("hidden");
+      snapAspectToDimensions(up.width, up.height);
+      checkAndPromptMetadataRestore(up.meta);
+      $("prompt").focus();
+    } catch (err) {
+      alert("Upload failed: " + (err.message || err));
+      editImageId = null;
+    }
+  }
+
+  async function useJobAsEditSource(job) {
+    if (!job || !job.id) return;
+    task = "edit";
+    setComposeExpanded(true, true);
+    refreshChips();
+    try {
+      let up;
+      try {
+        up = await api(`/api/uploads/from-image/${job.id}`, { method: "POST", body: "{}" });
+      } catch (_) {
+        const url = job.image || `/api/images/${job.id}.png`;
+        const blob = await fetch(url, { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.blob());
+        const file = new File([blob], `${job.id}.png`, { type: "image/png" });
+        up = await uploadEditFile(file);
+      }
+      editImageId = up.id;
+      $("editPreview").src = (up.url || `/api/uploads/${up.id}.png`) + "?t=" + Date.now();
+      $("editPreviewWrap").classList.remove("hidden");
+      snapAspectToDimensions(up.width, up.height);
+      const text = (job.user_prompt || job.prompt || "").trim();
+      if (text && !$("prompt").value.trim()) {
+        $("prompt").value = text;
+        autoGrowPrompt();
+      }
+      $("prompt").focus();
+    } catch (err) {
+      alert("Could not use as edit source: " + (err.message || err));
+      editImageId = null;
+    }
+    if (typeof closeSheet === "function") closeSheet();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
   async function useAnimateFile(file) {
     if (!file) return;
     task = "animate";
@@ -280,6 +395,7 @@
       animateImageId = up.id;
       $("animatePreview").src = up.url + "?t=" + Date.now();
       $("animatePreviewWrap").classList.remove("hidden");
+      checkAndPromptMetadataRestore(up.meta);
       $("prompt").focus();
     } catch (err) {
       alert("Upload failed: " + (err.message || err));
@@ -288,24 +404,33 @@
   }
 
   async function useJobAsAnimateSource(job) {
-    if (!job) return;
-    const url = job.image || (job.id ? `/api/images/${job.id}.png` : "");
-    if (!url) {
-      alert("This item has no still to animate");
-      return;
-    }
-    const blob = await fetch(url, { headers: pinHeaders(), credentials: "same-origin" }).then((r) => {
-      if (!r.ok) throw new Error("could not read the image");
-      return r.blob();
-    });
-    const file = new File([blob], `${job.id || "still"}.png`, { type: blob.type || "image/png" });
-    const text = (job.user_prompt || job.prompt || "").trim();
-    await useAnimateFile(file);
-    if (text && !$("prompt").value.trim()) {
-      $("prompt").value = text;
-      autoGrowPrompt();
-    }
+    if (!job || !job.id) return;
+    task = "animate";
     setComposeExpanded(true, true);
+    refreshChips();
+    try {
+      let up;
+      try {
+        up = await api(`/api/uploads/from-image/${job.id}`, { method: "POST", body: "{}" });
+      } catch (_) {
+        const url = job.image || `/api/images/${job.id}.png`;
+        const blob = await fetch(url, { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.blob());
+        const file = new File([blob], `${job.id || "still"}.png`, { type: blob.type || "image/png" });
+        up = await uploadEditFile(file);
+      }
+      animateImageId = up.id;
+      $("animatePreview").src = (up.url || `/api/uploads/${up.id}.png`) + "?t=" + Date.now();
+      $("animatePreviewWrap").classList.remove("hidden");
+      const text = (job.user_prompt || job.prompt || "").trim();
+      if (text && !$("prompt").value.trim()) {
+        $("prompt").value = text;
+        autoGrowPrompt();
+      }
+      $("prompt").focus();
+    } catch (err) {
+      alert("Could not use as animate source: " + (err.message || err));
+      animateImageId = null;
+    }
     if (typeof closeSheet === "function") closeSheet();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -599,12 +724,39 @@
       const shown = shownText(pill);
       pill.title = titleBits.length ? titleBits.join(" · ") : shown;
       if (s.pin_ok) $("gate").classList.add("hidden");
+      if (s.active_job && s.active_job.id && !activeJobId && !cancelRequested) {
+        resumeActiveJob(s.active_job);
+      }
     } catch {
       $("statusPill").textContent = "offline";
       $("statusPill").className = "err";
       $("statusPill").removeAttribute("title");
     } finally {
       statusInFlight = false;
+    }
+  }
+
+  let isResumingJob = false;
+  async function resumeActiveJob(info) {
+    if (activeJobId || isResumingJob) return;
+    isResumingJob = true;
+    try {
+      const job = await api("/api/jobs/" + info.id);
+      if (job.status === "queued" || job.status === "running") {
+        setComposeExpanded(true);
+        if (info.kind === "video" || job.kind === "video") {
+          task = "animate";
+          refreshChips();
+          await monitorAnimateJob(info.id, job);
+        } else {
+          task = "create";
+          refreshChips();
+          await monitorGenerateJob(info.id, job, job.steps || 8);
+        }
+      }
+    } catch (_) {}
+    finally {
+      isResumingJob = false;
     }
   }
 
@@ -673,13 +825,13 @@
 
   async function clearAll() {
     const ok = confirm(
-      "Clear ALL generated images from the gallery? This cannot be undone."
+      "Clear gallery? Starred images will be kept."
     );
     if (!ok) return;
     const btn = $("clearAll");
     if (btn) btn.disabled = true;
     try {
-      const res = await api("/api/clear-all", { method: "DELETE" });
+      const res = await api("/api/clear-all?keep_starred=true", { method: "DELETE" });
       // Reset result pane
       const rw = $("resultWrap");
       if (rw) rw.classList.add("hidden");
@@ -688,9 +840,8 @@
       closeLightbox();
       await loadGallery();
       const c = (res && res.cleared) || {};
-      alert(
-        `Cleared ${c.images || 0} images.`
-      );
+      const kept = res && res.kept_starred ? ` (${res.kept_starred} starred kept)` : "";
+      alert(`Cleared ${c.images || 0} images${kept}.`);
     } catch (e) {
       alert("Clear failed: " + (e.message || e));
     } finally {
@@ -741,11 +892,17 @@
   }
 
   function filteredGalleryItems() {
+    const searchEl = $("gallerySearch");
+    const q = (searchEl ? searchEl.value : "").trim().toLowerCase();
     return (galleryItems || []).filter((it) => {
-      if (galleryFilter === "videos") return it.kind === "video";
-      if (galleryFilter === "starred") return !!it.starred;
-      if (galleryFilter === "spicy") return !!(it.spicy || it.nsfw);
-      if (galleryFilter === "normal") return !(it.spicy || it.nsfw);
+      if (galleryFilter === "videos" && it.kind !== "video") return false;
+      if (galleryFilter === "starred" && !it.starred) return false;
+      if (galleryFilter === "spicy" && !(it.spicy || it.nsfw)) return false;
+      if (galleryFilter === "normal" && (it.spicy || it.nsfw)) return false;
+      if (q) {
+        const text = `${it.user_prompt || ""} ${it.prompt || ""} ${it.negative_prompt || ""} ${it.seed ?? ""}`.toLowerCase();
+        if (!text.includes(q)) return false;
+      }
       return true;
     });
   }
@@ -1487,6 +1644,8 @@
   function syncSelectUi() {
     const selBtn = $("selectModeBtn");
     const delBtn = $("deleteSelectedBtn");
+    const starBtn = $("starSelectedBtn");
+    const dlBtn = $("downloadSelectedBtn");
     if (selBtn) {
       selBtn.textContent = selectMode ? "Done" : "Select";
       selBtn.title = selectMode ? "Shift-click to select a range" : "Select images";
@@ -1494,6 +1653,14 @@
     if (delBtn) {
       delBtn.classList.toggle("hidden", !selectMode || selectedIds.size === 0);
       delBtn.textContent = selectedIds.size ? `Delete (${selectedIds.size})` : "Delete";
+    }
+    if (starBtn) {
+      starBtn.classList.toggle("hidden", !selectMode || selectedIds.size === 0);
+      starBtn.textContent = selectedIds.size ? `★ Star (${selectedIds.size})` : "★ Star";
+    }
+    if (dlBtn) {
+      dlBtn.classList.toggle("hidden", !selectMode || selectedIds.size === 0);
+      dlBtn.textContent = selectedIds.size ? `Download ZIP (${selectedIds.size})` : "Download (.zip)";
     }
   }
 
@@ -1561,6 +1728,28 @@
       if (hint) hint.classList.add("hidden");
     }
     if ($("sheetStar")) $("sheetStar").textContent = job.starred ? "★ Starred" : "★ Star";
+
+    const parentChip = $("sheetParentChip");
+    const sheetCompare = $("sheetCompare");
+    const sheetSourceImg = $("sheetSourceImg");
+    if (job.image_id && !isVideo) {
+      const srcUrl = `/api/uploads/${job.image_id}.png`;
+      if (sheetSourceImg) sheetSourceImg.src = srcUrl;
+      if (sheetCompare) sheetCompare.classList.remove("hidden");
+      if (parentChip) {
+        parentChip.classList.remove("hidden");
+        const parentThumb = $("sheetParentThumb");
+        if (parentThumb) parentThumb.src = srcUrl;
+      }
+    } else {
+      if (sheetCompare) sheetCompare.classList.add("hidden");
+      if (parentChip) parentChip.classList.add("hidden");
+      if (sheetSourceImg) {
+        sheetSourceImg.classList.add("hidden");
+        sheetSourceImg.src = "";
+      }
+    }
+
     $("sheetBackdrop").classList.remove("hidden");
     $("sheet").classList.remove("hidden");
     document.body.style.overflow = "hidden";
@@ -1570,6 +1759,12 @@
     $("sheet").classList.add("hidden");
     $("sheetBackdrop").classList.add("hidden");
     $("sheetImg").src = "";
+    if ($("sheetSourceImg")) {
+      $("sheetSourceImg").classList.add("hidden");
+      $("sheetSourceImg").src = "";
+    }
+    if ($("sheetCompare")) $("sheetCompare").classList.add("hidden");
+    if ($("sheetParentChip")) $("sheetParentChip").classList.add("hidden");
     const sheetVid = $("sheetVideo");
     if (sheetVid) {
       sheetVid.pause();
@@ -1580,8 +1775,33 @@
     document.body.style.overflow = "";
   }
 
-  function openLightbox(src) {
+  function navigateModal(delta) {
+    const items = filteredGalleryItems();
+    if (!items.length) return;
+    const current = sheetJob || lastJob;
+    const currentId = current ? current.id : null;
+    let idx = items.findIndex((it) => it.id === currentId);
+    if (idx === -1) idx = 0;
+    let nextIdx = idx + delta;
+    if (nextIdx < 0) nextIdx = items.length - 1;
+    else if (nextIdx >= items.length) nextIdx = 0;
+    const nextItem = items[nextIdx];
+    if (!nextItem) return;
+
+    const lb = $("lightbox");
+    if (lb && !lb.classList.contains("hidden")) {
+      openLightbox(nextItem.image || `/api/images/${nextItem.id}.png`, nextItem);
+      return;
+    }
+    const sh = $("sheet");
+    if (sh && !sh.classList.contains("hidden")) {
+      openSheet(nextItem);
+    }
+  }
+
+  function openLightbox(src, job) {
     if (!src) return;
+    if (job) lastJob = job;
     $("lightboxImg").src = src;
     $("lightbox").classList.remove("hidden");
     document.body.style.overflow = "hidden";
@@ -1603,6 +1823,13 @@
       ri.removeAttribute("src");
       ri.src = "";
     }
+    const rsi = $("resultSourceImg");
+    if (rsi) {
+      rsi.classList.add("hidden");
+      rsi.src = "";
+    }
+    const rcb = $("resultCompareBtn");
+    if (rcb) rcb.classList.add("hidden");
     const rv = $("resultVideo");
     if (rv) {
       rv.pause();
@@ -1646,8 +1873,23 @@
       $("downloadBtn").href = url;
       $("downloadBtn").download = `imagine-${job.id}.png`;
     }
+    const resCompare = $("resultCompareBtn");
+    const resSourceImg = $("resultSourceImg");
+    if (job.image_id && !isVideo) {
+      const srcUrl = `/api/uploads/${job.image_id}.png`;
+      if (resSourceImg) resSourceImg.src = srcUrl;
+      if (resCompare) resCompare.classList.remove("hidden");
+    } else {
+      if (resCompare) resCompare.classList.add("hidden");
+      if (resSourceImg) {
+        resSourceImg.classList.add("hidden");
+        resSourceImg.src = "";
+      }
+    }
     const animBtn = $("animateResultBtn");
     if (animBtn) animBtn.classList.toggle("hidden", !!isVideo);
+    const editBtn = $("editResultBtn");
+    if (editBtn) editBtn.classList.toggle("hidden", !!isVideo);
     if (job.seed != null) $("seed").value = job.seed;
     const text = (job.user_prompt || job.prompt || "").trim();
     const rp = $("resultPrompt");
@@ -1671,11 +1913,29 @@
     const text = (job.user_prompt || job.prompt || "").trim();
     if (!text) return;
     $("prompt").value = text;
-    if (job.negative_prompt != null) $("negative").value = job.negative_prompt || "";
+    if (job.negative_prompt != null && $("negative")) $("negative").value = job.negative_prompt || "";
     if (job.seed != null && $("seed")) $("seed").value = job.seed;
+    if (job.width && job.height) snapAspectToDimensions(job.width, job.height);
     setComposeExpanded(true, true);
     autoGrowPrompt();
+    updateComposeSummary();
     $("prompt").focus();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+    const rh = $("resultPromptHint");
+    const sh = $("sheetPromptHint");
+    [rh, sh].forEach((el) => {
+      if (el && !el.classList.contains("hidden")) {
+        const orig = el.textContent;
+        el.textContent = "Loaded into prompt ✓";
+        el.style.color = "var(--ok)";
+        setTimeout(() => {
+          el.textContent = orig;
+          el.style.color = "";
+        }, 1500);
+      }
+    });
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -1715,33 +1975,25 @@
     setTimeout(() => $("progressWrap").classList.add("hidden"), 2500);
   }
 
-  async function animate() {
-    if (h3Known && !h3Video) {
-      alert(h3Detail || "Local H3 is not ready.");
-      return;
-    }
-    if (!animateImageId) {
-      alert("Drop a screenshot or choose an image first");
-      const drop = $("animateDrop");
-      if (drop) drop.focus();
-      return;
-    }
-    const prompt = $("prompt").value.trim();
+  const ACTIVE_JOB_KEY = "imagine_active_job";
+  function saveActiveJob(jobId, kind) {
+    try {
+      sessionStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify({ id: jobId, kind }));
+    } catch (_) {}
+  }
+  function clearActiveJob() {
+    try {
+      sessionStorage.removeItem(ACTIVE_JOB_KEY);
+    } catch (_) {}
+  }
+
+  async function monitorAnimateJob(jobId, started) {
+    activeJobId = jobId;
+    saveActiveJob(jobId, "video");
     const bar = beginProgress();
     bar.classList.add("indeterminate");
     $("progressLabel").textContent = "H3 · starting";
     try {
-      const started = await api("/api/animate", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt,
-          image_id: animateImageId,
-          duration,
-          resolution,
-        }),
-      });
-      const jobId = started.id;
-      activeJobId = jobId;
       let job = started;
       while (job.status === "queued" || job.status === "running") {
         if (cancelRequested) {
@@ -1770,7 +2022,89 @@
       bar.classList.add("indeterminate");
       $("progressLabel").textContent = "Failed: " + (e.message || e);
     } finally {
+      clearActiveJob();
       endProgress();
+    }
+  }
+
+  async function monitorGenerateJob(jobId, started, expectedSteps = 8, prefix = "") {
+    activeJobId = jobId;
+    saveActiveJob(jobId, "image");
+    const bar = beginProgress();
+    try {
+      let job = started;
+      while (job.status === "queued" || job.status === "running") {
+        if (cancelRequested) {
+          try { await api(`/api/jobs/${jobId}/cancel`, { method: "POST", body: "{}" }); } catch (_) {}
+          throw new Error("Cancelled");
+        }
+        if (job.status === "cancelled") throw new Error("Cancelled");
+        await new Promise((r) => setTimeout(r, 400));
+        job = await api("/api/jobs/" + jobId);
+        const pct = Math.max(0, Math.min(100, Number(job.pct) || 0));
+        const step = job.step != null ? job.step : "?";
+        const steps = job.steps != null ? job.steps : expectedSteps;
+        if (job.status === "queued" || (pct === 0 && Number(step) === 0)) {
+          bar.style.width = "0%";
+          bar.classList.add("indeterminate");
+          const ahead = Number(job.queue_ahead);
+          let waitMsg = prefix + "Waiting · next up";
+          if (Number.isFinite(ahead) && ahead > 0) {
+            waitMsg = prefix + (ahead === 1
+              ? "Waiting · #2 in queue"
+              : `Waiting · #${ahead + 1} in queue`);
+          }
+          if (job.eta_s != null && Number(job.eta_s) > 0) {
+            waitMsg += ` · ~${Math.round(Number(job.eta_s))}s`;
+          }
+          $("progressLabel").textContent = waitMsg;
+        } else {
+          bar.classList.remove("indeterminate");
+          bar.style.width = pct + "%";
+          $("progressLabel").textContent = `${prefix}${pct}% · step ${step}/${steps}`;
+        }
+      }
+      if (job.status === "error") {
+        throw new Error(typeof job.error === "string" ? job.error : JSON.stringify(job.error || "failed"));
+      }
+      bar.style.width = "100%";
+      showResult(job);
+      loadGallery();
+      $("progressLabel").textContent = `${prefix}Done · 100% · ${job.elapsed_s || "?"}s`;
+    } catch (e) {
+      bar.classList.add("indeterminate");
+      $("progressLabel").textContent = "Failed: " + (e.message || e);
+    } finally {
+      clearActiveJob();
+      endProgress();
+    }
+  }
+
+  async function animate() {
+    if (h3Known && !h3Video) {
+      alert(h3Detail || "Local H3 is not ready.");
+      return;
+    }
+    if (!animateImageId) {
+      alert("Drop a screenshot or choose an image first");
+      const drop = $("animateDrop");
+      if (drop) drop.focus();
+      return;
+    }
+    const prompt = $("prompt").value.trim();
+    try {
+      const started = await api("/api/animate", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          image_id: animateImageId,
+          duration,
+          resolution,
+        }),
+      });
+      await monitorAnimateJob(started.id, started);
+    } catch (e) {
+      alert("Animate request failed: " + (e.message || e));
     }
   }
 
@@ -1787,13 +2121,19 @@
       return;
     }
     const seedRaw = $("seed").value;
+    let chosenSeed = null;
+    if (seedLocked && seedRaw !== "") {
+      chosenSeed = Number(seedRaw);
+    } else if (!seedLocked && seedRaw !== "") {
+      $("seed").value = "";
+    }
     const body = {
       prompt,
       negative_prompt: $("negative").value.trim(),
       width: aspect.w,
       height: aspect.h,
       steps: Number($("steps").value) || 8,
-      seed: seedRaw === "" ? null : Number(seedRaw),
+      seed: chosenSeed,
       style: style.id || null,
       spicy: !!spicy,
       rgba: !!rgba,
@@ -1801,55 +2141,54 @@
       image_id: task === "edit" ? editImageId : null,
       strength: task === "edit" ? Number(strength) || 0.65 : undefined,
     };
-    const bar = beginProgress();
     try {
       const started = await api("/api/generate", { method: "POST", body: JSON.stringify(body) });
-      const jobId = started.id;
-      activeJobId = jobId;
-      let job = started;
-      while (job.status === "queued" || job.status === "running") {
-        if (cancelRequested) {
-          try { await api(`/api/jobs/${jobId}/cancel`, { method: "POST", body: "{}" }); } catch (_) {}
-          throw new Error("Cancelled");
-        }
-        if (job.status === "cancelled") throw new Error("Cancelled");
-        await new Promise((r) => setTimeout(r, 400));
-        job = await api("/api/jobs/" + jobId);
-        const pct = Math.max(0, Math.min(100, Number(job.pct) || 0));
-        const step = job.step != null ? job.step : "?";
-        const steps = job.steps != null ? job.steps : body.steps;
-        if (job.status === "queued" || (pct === 0 && Number(step) === 0)) {
-          bar.style.width = "0%";
-          bar.classList.add("indeterminate");
-          const ahead = Number(job.queue_ahead);
-          let waitMsg = "Waiting · next up";
-          if (Number.isFinite(ahead) && ahead > 0) {
-            waitMsg = ahead === 1
-              ? "Waiting · #2 in queue"
-              : `Waiting · #${ahead + 1} in queue`;
-          }
-          if (job.eta_s != null && Number(job.eta_s) > 0) {
-            waitMsg += ` · ~${Math.round(Number(job.eta_s))}s`;
-          }
-          $("progressLabel").textContent = waitMsg;
-        } else {
-          bar.classList.remove("indeterminate");
-          bar.style.width = pct + "%";
-          $("progressLabel").textContent = `${pct}% · step ${step}/${steps}`;
-        }
-      }
-      if (job.status === "error") {
-        throw new Error(typeof job.error === "string" ? job.error : JSON.stringify(job.error || "failed"));
-      }
-      bar.style.width = "100%";
-      showResult(job);
-      loadGallery();
-      $("progressLabel").textContent = `Done · 100% · ${job.elapsed_s || "?"}s`;
+      await monitorGenerateJob(started.id, started, body.steps);
     } catch (e) {
-      bar.classList.add("indeterminate");
-      $("progressLabel").textContent = "Failed: " + (e.message || e);
-    } finally {
-      endProgress();
+      alert("Generate request failed: " + (e.message || e));
+    }
+  }
+
+  async function generateBatch(count = 4) {
+    if (task === "animate") {
+      alert("Batch generation is for still images.");
+      return;
+    }
+    const prompt = $("prompt").value.trim();
+    if (!prompt) {
+      setComposeExpanded(true, true);
+      $("prompt").focus();
+      return;
+    }
+    if (task === "edit" && !editImageId) {
+      alert("Pick a source image for Edit mode");
+      return;
+    }
+    const baseSeed = $("seed").value === "" ? Math.floor(Math.random() * 2 ** 30) : Number($("seed").value);
+    for (let i = 0; i < count; i++) {
+      if (cancelRequested) break;
+      const curSeed = seedLocked ? (baseSeed + i) : Math.floor(Math.random() * 2 ** 31);
+      const body = {
+        prompt,
+        negative_prompt: $("negative").value.trim(),
+        width: aspect.w,
+        height: aspect.h,
+        steps: Number($("steps").value) || 8,
+        seed: curSeed,
+        style: style.id || null,
+        spicy: !!spicy,
+        rgba: !!rgba,
+        framing: !!framing,
+        image_id: task === "edit" ? editImageId : null,
+        strength: task === "edit" ? Number(strength) || 0.65 : undefined,
+      };
+      try {
+        const started = await api("/api/generate", { method: "POST", body: JSON.stringify(body) });
+        await monitorGenerateJob(started.id, started, body.steps, `[${i + 1}/${count}] `);
+      } catch (e) {
+        if (!cancelRequested) alert(`Batch generation item ${i + 1} failed: ` + (e.message || e));
+        break;
+      }
     }
   }
 
@@ -1875,6 +2214,10 @@
   if ($("sheetImg")) $("sheetImg").onclick = () => {
     if ($("sheetImg").src) openLightbox($("sheetImg").src);
   };
+  if ($("sheetPrev")) $("sheetPrev").onclick = (e) => { e.stopPropagation(); navigateModal(-1); };
+  if ($("sheetNext")) $("sheetNext").onclick = (e) => { e.stopPropagation(); navigateModal(1); };
+  if ($("lightboxPrev")) $("lightboxPrev").onclick = (e) => { e.stopPropagation(); navigateModal(-1); };
+  if ($("lightboxNext")) $("lightboxNext").onclick = (e) => { e.stopPropagation(); navigateModal(1); };
   if ($("sheetDelete")) $("sheetDelete").onclick = () => {
     if (!sheetJob || deletingIds.has(sheetJob.id)) return;
     if (!confirm("Delete this image?")) return;
@@ -1889,15 +2232,72 @@
       closeLightbox();
       return;
     }
-    if ((e.key === "c" || e.key === "C") && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      const active = document.activeElement;
-      const tag = active ? active.tagName.toLowerCase() : "";
-      if (tag === "input" || tag === "textarea" || tag === "select" || (active && active.isContentEditable)) {
+    const lbOpen = $("lightbox") && !$("lightbox").classList.contains("hidden");
+    const sheetOpen = $("sheet") && !$("sheet").classList.contains("hidden");
+    const active = document.activeElement;
+    const tag = active ? active.tagName.toLowerCase() : "";
+    const isEditingText = tag === "input" || tag === "textarea" || tag === "select" || (active && active.isContentEditable);
+
+    if (lbOpen || sheetOpen) {
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        navigateModal(-1);
         return;
       }
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        navigateModal(1);
+        return;
+      }
+      if (!isEditingText && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const currentItem = sheetJob || lastJob;
+        const key = e.key.toLowerCase();
+        if (key === "s") {
+          e.preventDefault();
+          if ($("sheetStar")) $("sheetStar").click();
+          return;
+        }
+        if (key === "r") {
+          e.preventDefault();
+          usePromptFromJob(currentItem);
+          closeSheet();
+          closeLightbox();
+          return;
+        }
+        if (key === "e") {
+          e.preventDefault();
+          if ($("sheetUseSource")) $("sheetUseSource").click();
+          return;
+        }
+        if (key === "a") {
+          e.preventDefault();
+          if ($("sheetAnimate")) $("sheetAnimate").click();
+          return;
+        }
+        if (key === "d") {
+          e.preventDefault();
+          const dl = sheetOpen ? $("sheetDownload") : $("downloadBtn");
+          if (dl && dl.href) dl.click();
+          return;
+        }
+        if (e.key === "Delete" || e.key === "Backspace") {
+          e.preventDefault();
+          if (sheetOpen && $("sheetDelete")) $("sheetDelete").click();
+          return;
+        }
+      }
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      if (active === $("prompt") || active === $("negative")) {
+        e.preventDefault();
+        $("generateBtn").click();
+        return;
+      }
+    }
+    if ((e.key === "c" || e.key === "C") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (isEditingText) return;
       if ($("gate") && !$("gate").classList.contains("hidden")) return;
-      if ($("sheet") && !$("sheet").classList.contains("hidden")) return;
-      if ($("lightbox") && !$("lightbox").classList.contains("hidden")) return;
+      if (sheetOpen || lbOpen) return;
       e.preventDefault();
       toggleComposePanel();
     }
@@ -1964,24 +2364,15 @@
   setComposeExpanded(false);
 
   
+  if ($("editBrowse") && $("editFile")) {
+    $("editBrowse").onclick = () => $("editFile").click();
+  }
   if ($("editFile")) {
     $("editFile").onchange = async (e) => {
       const file = e.target.files && e.target.files[0];
       if (!file) return;
-      try {
-        $("progressLabel") && ($("progressLabel").textContent = "Uploading…");
-        const up = await uploadEditFile(file);
-        editImageId = up.id;
-        $("editPreview").src = up.url + "?t=" + Date.now();
-        $("editPreviewWrap").classList.remove("hidden");
-        // Snap aspect to upload if close
-        if (up.width && up.height) {
-          // keep user aspect; worker will resize
-        }
-      } catch (err) {
-        alert("Upload failed: " + (err.message || err));
-        editImageId = null;
-      }
+      await useEditFile(file);
+      e.target.value = "";
     };
   }
   if ($("clearEdit")) {
@@ -1991,6 +2382,24 @@
       $("editPreviewWrap").classList.add("hidden");
       $("editPreview").src = "";
     };
+  }
+  const editDrop = $("editDrop");
+  if (editDrop) {
+    editDrop.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      editDrop.classList.add("dragover");
+    });
+    editDrop.addEventListener("dragleave", () => editDrop.classList.remove("dragover"));
+    editDrop.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepth = 0;
+      editDrop.classList.remove("dragover");
+      const overlay = $("dropOverlay");
+      if (overlay) overlay.classList.add("hidden");
+      const file = firstImageFile(e.dataTransfer && e.dataTransfer.files);
+      if (file) await useEditFile(file);
+    });
   }
 
   if ($("animateBrowse") && $("animateFile")) {
@@ -2028,6 +2437,11 @@
       if (file) await useAnimateFile(file);
     });
   }
+  if ($("editResultBtn")) {
+    $("editResultBtn").onclick = () => {
+      useJobAsEditSource(lastJob).catch((e) => alert("Could not use this still: " + (e.message || e)));
+    };
+  }
   if ($("animateResultBtn")) {
     $("animateResultBtn").onclick = () => {
       useJobAsAnimateSource(lastJob).catch((e) => alert("Could not use this still: " + (e.message || e)));
@@ -2058,7 +2472,12 @@
     if (!dragHasFiles(e)) return;
     dragDepth += 1;
     const overlay = $("dropOverlay");
-    if (overlay) overlay.classList.remove("hidden");
+    if (overlay) {
+      overlay.classList.remove("hidden");
+      overlay.textContent = task === "edit"
+        ? "Drop image to edit with Qwen"
+        : "Drop to animate with local H3";
+    }
   });
   document.addEventListener("dragover", (e) => {
     if (!dragHasFiles(e)) return;
@@ -2068,23 +2487,36 @@
     dragDepth = Math.max(0, dragDepth - 1);
     if (dragDepth === 0) {
       const overlay = $("dropOverlay");
-      if (overlay) overlay.classList.add("hidden");
+      if (overlay) {
+        overlay.classList.add("hidden");
+        overlay.textContent = "Drop to animate with local H3";
+      }
     }
   });
   document.addEventListener("dragend", () => {
     dragDepth = 0;
     const overlay = $("dropOverlay");
-    if (overlay) overlay.classList.add("hidden");
+    if (overlay) {
+      overlay.classList.add("hidden");
+      overlay.textContent = "Drop to animate with local H3";
+    }
   });
   document.addEventListener("drop", async (e) => {
     dragDepth = 0;
     const overlay = $("dropOverlay");
-    if (overlay) overlay.classList.add("hidden");
+    if (overlay) {
+      overlay.classList.add("hidden");
+      overlay.textContent = "Drop to animate with local H3";
+    }
     if ($("gate") && !$("gate").classList.contains("hidden")) return;
     const file = firstImageFile(e.dataTransfer && e.dataTransfer.files);
     if (!file) return;
     e.preventDefault();
-    await useAnimateFile(file);
+    if (task === "edit") {
+      await useEditFile(file);
+    } else {
+      await useAnimateFile(file);
+    }
   });
   document.addEventListener("paste", async (e) => {
     if ($("gate") && !$("gate").classList.contains("hidden")) return;
@@ -2095,7 +2527,11 @@
         const file = item.getAsFile();
         if (!file) return;
         e.preventDefault();
-        await useAnimateFile(file);
+        if (task === "edit") {
+          await useEditFile(file);
+        } else {
+          await useAnimateFile(file);
+        }
         return;
       }
     }
@@ -2159,27 +2595,259 @@
     };
   }
   if ($("sheetUseSource")) {
-    $("sheetUseSource").onclick = async () => {
-      if (!sheetJob) return;
-      try {
-        // Re-upload gallery image as edit source via fetch→blob→upload
-        const url = sheetJob.image || `/api/images/${sheetJob.id}.png`;
-        const blob = await fetch(url, { headers: pinHeaders(), credentials: "same-origin" }).then((r) => r.blob());
-        const file = new File([blob], `${sheetJob.id}.png`, { type: "image/png" });
-        const up = await uploadEditFile(file);
-        editImageId = up.id;
-        task = "edit";
-        $("editPreview").src = (up.url || url) + "?t=" + Date.now();
-        $("editPreviewWrap").classList.remove("hidden");
-        setComposeExpanded(true, true);
-        refreshChips();
-        closeSheet();
-        window.scrollTo({ top: 0, behavior: "smooth" });
-      } catch (e) {
-        alert("Could not use as source: " + (e.message || e));
+    $("sheetUseSource").onclick = () => {
+      useJobAsEditSource(sheetJob).catch((e) => alert("Could not use as source: " + (e.message || e)));
+    };
+  }
+
+  function bindCompareButton(btnId, targetImgId, sourceImgId) {
+    const btn = $(btnId);
+    const target = $(targetImgId);
+    const src = $(sourceImgId);
+    if (!btn || !target || !src) return;
+    const showSource = (e) => {
+      if (e) e.preventDefault();
+      target.classList.add("hidden");
+      src.classList.remove("hidden");
+      btn.classList.add("active");
+      btn.textContent = "Source (original)";
+    };
+    const showTarget = (e) => {
+      if (e) e.preventDefault();
+      src.classList.add("hidden");
+      target.classList.remove("hidden");
+      btn.classList.remove("active");
+      btn.textContent = "Hold to view source";
+    };
+    btn.addEventListener("mousedown", showSource);
+    btn.addEventListener("touchstart", showSource, { passive: false });
+    btn.addEventListener("mouseup", showTarget);
+    btn.addEventListener("mouseleave", showTarget);
+    btn.addEventListener("touchend", showTarget);
+    btn.addEventListener("touchcancel", showTarget);
+  }
+
+  bindCompareButton("resultCompareBtn", "resultImg", "resultSourceImg");
+  bindCompareButton("sheetCompare", "sheetImg", "sheetSourceImg");
+
+  if ($("sheetParentChip")) {
+    $("sheetParentChip").onclick = () => {
+      if (!sheetJob || !sheetJob.image_id) return;
+      const parentId = sheetJob.image_id;
+      const found = galleryItems.find((it) => it.id === parentId);
+      if (found) {
+        openSheet(found);
+      } else {
+        openLightbox(`/api/uploads/${parentId}.png`);
       }
     };
   }
+
+  if ($("starSelectedBtn")) {
+    $("starSelectedBtn").onclick = async () => {
+      const ids = Array.from(selectedIds);
+      if (!ids.length) return;
+      try {
+        const res = await api("/api/gallery/star-batch", {
+          method: "POST",
+          body: JSON.stringify({ ids }),
+        });
+        const targetState = res.starred;
+        ids.forEach((id) => {
+          const item = galleryItems.find((x) => x.id === id);
+          if (item) item.starred = targetState;
+          const card = galleryCardEl(id);
+          if (card) syncGalleryCard(card, item || { id, starred: targetState });
+        });
+      } catch (e) {
+        alert("Batch star failed: " + (e.message || e));
+      }
+    };
+  }
+
+  if ($("downloadSelectedBtn")) {
+    $("downloadSelectedBtn").onclick = async () => {
+      const ids = Array.from(selectedIds);
+      if (!ids.length) return;
+      try {
+        const res = await fetch("/api/gallery/archive", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, pinHeaders()),
+          body: JSON.stringify({ ids }),
+        });
+        if (!res.ok) throw new Error("Archive export failed: " + res.statusText);
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `imagine-export-${Date.now()}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      } catch (e) {
+        alert("Download failed: " + (e.message || e));
+      }
+    };
+  }
+
+  if ($("lockSeed")) $("lockSeed").onclick = toggleLockSeed;
+  if ($("generateBatchBtn")) $("generateBatchBtn").onclick = () => generateBatch(4);
+
+  function bindPromptHistory() {
+    const toggleBtn = $("toggleHistoryBtn");
+    const drawer = $("historyDrawer");
+    const list = $("historyList");
+    const clearBtn = $("clearHistoryBtn");
+    const searchInput = $("historySearch");
+    if (!toggleBtn || !drawer || !list) return;
+
+    let historyItems = [];
+
+    function renderHistoryList(filterText = "") {
+      const q = (filterText || "").trim().toLowerCase();
+      const filtered = q
+        ? historyItems.filter((it) => (it.prompt || "").toLowerCase().includes(q))
+        : historyItems;
+
+      list.innerHTML = "";
+      if (!filtered || !filtered.length) {
+        list.innerHTML = `<div class="history-empty">${q ? "No matching prompts." : "No prompt history yet."}</div>`;
+        return;
+      }
+
+      filtered.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "history-item" + (item.pinned ? " pinned" : "");
+
+        const metaBits = [];
+        if (item.width && item.height) metaBits.push(`${item.width}×${item.height}`);
+        if (item.style) metaBits.push(item.style);
+        if (item.created_at) {
+          const d = new Date(item.created_at * 1000);
+          metaBits.push(d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+        }
+
+        row.innerHTML = `
+          <button type="button" class="hitem-pin${item.pinned ? " pinned" : ""}" title="${item.pinned ? "Unpin prompt" : "Pin prompt to top"}" aria-label="Pin prompt">${item.pinned ? "📌" : "📍"}</button>
+          <div class="hitem-body" tabindex="0" role="button">
+            <div class="hitem-text"></div>
+            ${metaBits.length ? `<div class="hitem-meta">${metaBits.join(" · ")}</div>` : ""}
+          </div>
+          <button type="button" class="hitem-del" title="Delete prompt" aria-label="Delete prompt">✕</button>
+        `;
+        row.querySelector(".hitem-text").textContent = item.prompt || "";
+        row.querySelector(".hitem-body").onclick = () => {
+          $("prompt").value = item.prompt || "";
+          if (item.negative_prompt != null && $("negative")) {
+            $("negative").value = item.negative_prompt;
+          }
+          if (item.width && item.height) {
+            snapAspectToDimensions(item.width, item.height);
+          }
+          if (item.style != null) {
+            const matchedStyle = STYLES.find((s) => s.id === item.style) || STYLES[0];
+            style = matchedStyle;
+          }
+          refreshChips();
+          autoGrowPrompt();
+          updateComposeSummary();
+          drawer.classList.add("hidden");
+          toggleBtn.setAttribute("aria-expanded", "false");
+          $("prompt").focus();
+        };
+
+        const pinBtn = row.querySelector(".hitem-pin");
+        pinBtn.onclick = async (e) => {
+          e.stopPropagation();
+          try {
+            await api(`/api/prompt-history/${item.id}/pin`, { method: "POST", body: "{}" });
+            await loadHistory();
+          } catch (err) {
+            alert("Pin failed: " + (err.message || err));
+          }
+        };
+
+        const delBtn = row.querySelector(".hitem-del");
+        delBtn.onclick = async (e) => {
+          e.stopPropagation();
+          try {
+            await api(`/api/prompt-history/${item.id}`, { method: "DELETE" });
+            row.remove();
+            historyItems = historyItems.filter((x) => x.id !== item.id);
+            if (!list.children.length) {
+              list.innerHTML = `<div class="history-empty">No prompt history yet.</div>`;
+            }
+          } catch (err) {
+            alert("Delete failed: " + (err.message || err));
+          }
+        };
+
+        list.appendChild(row);
+      });
+    }
+
+    async function loadHistory() {
+      try {
+        const res = await api("/api/prompt-history");
+        historyItems = res && res.items ? res.items : (Array.isArray(res) ? res : []);
+        renderHistoryList(searchInput ? searchInput.value : "");
+      } catch (err) {
+        list.innerHTML = `<div class="history-empty">Failed to load history: ${err.message || err}</div>`;
+      }
+    }
+
+    if (searchInput) {
+      searchInput.addEventListener("input", () => {
+        renderHistoryList(searchInput.value);
+      });
+    }
+
+    toggleBtn.onclick = (e) => {
+      e.stopPropagation();
+      const isOpen = !drawer.classList.contains("hidden");
+      if (isOpen) {
+        drawer.classList.add("hidden");
+        toggleBtn.setAttribute("aria-expanded", "false");
+      } else {
+        drawer.classList.remove("hidden");
+        toggleBtn.setAttribute("aria-expanded", "true");
+        loadHistory();
+      }
+    };
+
+    if (clearBtn) {
+      clearBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm("Clear prompt history? (Pinned prompts will be kept)")) return;
+        try {
+          await api("/api/prompt-history", { method: "DELETE" });
+          historyItems = historyItems.filter((x) => x.pinned);
+          renderHistoryList(searchInput ? searchInput.value : "");
+        } catch (err) {
+          alert("Clear failed: " + (err.message || err));
+        }
+      };
+    }
+
+    document.addEventListener("click", (e) => {
+      if (!drawer.classList.contains("hidden") && !drawer.contains(e.target) && e.target !== toggleBtn) {
+        drawer.classList.add("hidden");
+        toggleBtn.setAttribute("aria-expanded", "false");
+      }
+    });
+  }
+
+  bindPromptHistory();
+
+  const gallerySearchEl = $("gallerySearch");
+  if (gallerySearchEl) {
+    gallerySearchEl.addEventListener("input", () => {
+      galleryPage = 1;
+      paintGallery();
+    });
+  }
+
   renderGalleryFilters();
   bindGalleryCols();
   applyGalleryCols();

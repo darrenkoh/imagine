@@ -34,7 +34,7 @@ PY
 # kill prior portal on 7860 if we own it
 if [[ -f "$ROOT/data/portal.pid" ]]; then
   old=$(cat "$ROOT/data/portal.pid" || true)
-  if [[ -n "${old:-}" ]] && kill -0 "$old" 2>/dev/null; then
+  if [[ -n "${old:-}" ]] && [[ "$old" != "$$" ]] && kill -0 "$old" 2>/dev/null; then
     echo "[run_portal] stopping pid $old"
     kill "$old" || true
     sleep 1
