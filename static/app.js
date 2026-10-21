@@ -73,7 +73,10 @@
 
   const $ = (id) => document.getElementById(id);
   const pinHeaders = () => {
-    const pin = localStorage.getItem("imagine_pin") || "";
+    let pin = "";
+    try {
+      pin = localStorage.getItem("imagine_pin") || sessionStorage.getItem("imagine_pin") || "";
+    } catch (_) {}
     return pin ? { "X-Imagine-Pin": pin } : {};
   };
 
@@ -85,8 +88,11 @@
     );
     const res = await fetch(path, { ...opts, headers, credentials: "same-origin" });
     if (res.status === 401) {
-      localStorage.removeItem("imagine_pin");
-      $("gate").classList.remove("hidden");
+      if (path !== "/api/auth") {
+        try { localStorage.removeItem("imagine_pin"); } catch (_) {}
+        try { sessionStorage.removeItem("imagine_pin"); } catch (_) {}
+        $("gate").classList.remove("hidden");
+      }
       throw new Error("unauthorized");
     }
     const ct = res.headers.get("content-type") || "";
@@ -540,7 +546,8 @@
     $("pinErr").classList.add("hidden");
     try {
       await api("/api/auth", { method: "POST", body: JSON.stringify({ pin }) });
-      localStorage.setItem("imagine_pin", pin);
+      try { localStorage.setItem("imagine_pin", pin); } catch (_) {}
+      try { sessionStorage.setItem("imagine_pin", pin); } catch (_) {}
       $("gate").classList.add("hidden");
       pollStatus();
       loadGallery();
@@ -723,7 +730,12 @@
       if (ifaces.length > 1) titleBits.push(ifaces.join(", "));
       const shown = shownText(pill);
       pill.title = titleBits.length ? titleBits.join(" · ") : shown;
-      if (s.pin_ok) $("gate").classList.add("hidden");
+      if (s.pin_ok) {
+        $("gate").classList.add("hidden");
+        if (galleryItems.length === 0) {
+          loadGallery();
+        }
+      }
       if (s.active_job && s.active_job.id && !activeJobId && !cancelRequested) {
         resumeActiveJob(s.active_job);
       }
@@ -2335,16 +2347,25 @@
     generate();
   };
 
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    const qPin = urlParams.get("pin");
+    if (qPin) {
+      try { localStorage.setItem("imagine_pin", qPin); } catch (_) {}
+      try { sessionStorage.setItem("imagine_pin", qPin); } catch (_) {}
+    }
+  } catch (_) {}
+
   refreshChips();
-  if (localStorage.getItem("imagine_pin")) {
-    // probe
-    fetch("/api/gallery", { headers: pinHeaders(), credentials: "same-origin" }).then((r) => {
+  // Probe gallery to see if cookie session or stored pin is valid
+  fetch("/api/gallery", { headers: pinHeaders(), credentials: "same-origin" })
+    .then((r) => {
       if (r.ok) {
         $("gate").classList.add("hidden");
         loadGallery();
-        }
-    });
-  }
+      }
+    })
+    .catch(() => {});
   pollStatus();
   
   const promptEl = $("prompt");

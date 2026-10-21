@@ -220,7 +220,7 @@ class TurboDefaultsTest(unittest.TestCase):
         self.assertIn('id="galleryPageRail"', html)
         self.assertNotIn("galleryPagePrev", html)
         self.assertNotIn("galleryPageSize", html)
-        self.assertIn("app.js?v=111", html)
+        self.assertIn("app.js?v=112", html)
 
     def test_still_gallery_thumb_uses_the_original_image(self) -> None:
         client = TestClient(app.app)

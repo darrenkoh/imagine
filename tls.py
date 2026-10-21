@@ -24,6 +24,16 @@ def _default_sans() -> list[str]:
         "spark-7819.local",
         "100.123.177.66",
     ]
+    try:
+        hostname = socket.gethostname()
+        hosts.append(hostname)
+        if not hostname.endswith(".local"):
+            hosts.append(f"{hostname}.local")
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127."):
+                hosts.append(ip)
+    except Exception:
+        pass
     extra = os.environ.get("IMAGINE_TLS_HOSTS", "")
     if extra:
         hosts.extend(h.strip() for h in extra.split(",") if h.strip())

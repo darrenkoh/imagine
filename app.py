@@ -752,13 +752,21 @@ async def auth(request: Request) -> JSONResponse:
     if pin != PIN:
         raise HTTPException(401, "bad pin")
     resp = JSONResponse({"ok": True})
+    is_https = request.url.scheme == "https"
+    host = (request.url.hostname or "").lower()
+    is_local = (
+        host in ("localhost", "127.0.0.1", "::1")
+        or host.endswith(".local")
+        or bool(re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)", host))
+    )
+    is_secure = is_https and not is_local
     resp.set_cookie(
         COOKIE,
         PIN,
         httponly=True,
         samesite="lax",
         max_age=60 * 60 * 24 * 30,
-        secure=request.url.scheme == "https",
+        secure=is_secure,
     )
     return resp
 
