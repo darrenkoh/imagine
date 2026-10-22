@@ -91,3 +91,52 @@ class LocalH3AnimateTest(unittest.TestCase):
         self.assertIn(">15<", html)
         self.assertIn(">20<", html)
         self.assertIn("statusRate", html)
+
+    def test_h3_lock_encloses_subprocess_execution(self) -> None:
+        runner = inspect.getsource(app._run_animate)
+        lock_idx = runner.find("async with _h3_lock:")
+        subproc_idx = runner.find("create_subprocess_exec")
+        poster_idx = runner.find("_save_poster")
+        self.assertGreater(lock_idx, -1)
+        self.assertGreater(subproc_idx, lock_idx)
+        self.assertGreater(poster_idx, subproc_idx)
+
+    def test_active_job_tracking_and_gallery_bump(self) -> None:
+        jid = "testact001"
+        data = {"id": jid, "kind": "image", "status": "queued", "created_at": 100.0}
+        app._write_job(jid, data, bump_gallery=True)
+        self.assertIn(jid, app._active_jobs)
+        self.assertEqual(app._active_job()["id"], jid)
+
+        # Queue stats ahead calculation
+        jid2 = "testact002"
+        data2 = {"id": jid2, "kind": "image", "status": "running", "created_at": 200.0}
+        app._write_job(jid2, data2, bump_gallery=False)
+        self.assertEqual(app._queue_stats(jid2, data2)["queue_ahead"], 1)
+
+        # Intermediate touch without bump
+        gen_before = app._gallery_gen
+        data2["pct"] = 50
+        app._write_job(jid2, data2, bump_gallery=False)
+        self.assertEqual(app._gallery_gen, gen_before)
+
+        # Done removes from active jobs
+        data2["status"] = "done"
+        data2["elapsed_s"] = 5.2
+        app._write_job(jid2, data2, bump_gallery=True)
+        self.assertNotIn(jid2, app._active_jobs)
+        self.assertGreater(app._gallery_gen, gen_before)
+
+        # Cleanup test jobs
+        (app.JOBS / f"{jid}.json").unlink(missing_ok=True)
+        (app.JOBS / f"{jid2}.json").unlink(missing_ok=True)
+        app._active_jobs.pop(jid, None)
+        app._active_jobs.pop(jid2, None)
+
+    def test_telemetry_module_integration(self) -> None:
+        import telemetry
+        for fn in ("_cpu_percent", "_cpu_temp_c", "_gpu_stats", "_meminfo", "_net_bandwidth", "_docker_running", "_ram_gb"):
+            self.assertTrue(hasattr(telemetry, fn))
+            self.assertTrue(hasattr(app, fn))
+        self.assertFalse(hasattr(app, "_gpu_percent"))
+        self.assertFalse(hasattr(app, "_gpu_temp_c"))
