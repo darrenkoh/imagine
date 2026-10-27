@@ -2648,6 +2648,66 @@
     btn.addEventListener("touchcancel", showTarget);
   }
 
+  function installNativeSizeFullscreen() {
+    const proto = HTMLVideoElement.prototype;
+    if (proto.__imagineNativeFs) return;
+    proto.__imagineNativeFs = true;
+    const orig = proto.requestFullscreen;
+    const origWebkit = proto.webkitRequestFullscreen;
+    const origEnter = proto.webkitEnterFullscreen;
+    function openStage(video) {
+      const parent = video.parentNode;
+      const next = video.nextSibling;
+      const stage = document.createElement("div");
+      stage.className = "fs-stage";
+      stage.appendChild(video);
+      document.body.appendChild(stage);
+      let restored = false;
+      const restore = () => {
+        if (restored) return;
+        restored = true;
+        document.removeEventListener("fullscreenchange", onChange);
+        document.removeEventListener("webkitfullscreenchange", onChange);
+        if (parent && parent.isConnected) parent.insertBefore(video, next);
+        stage.remove();
+      };
+      function onChange() {
+        const cur = document.fullscreenElement || document.webkitFullscreenElement;
+        if (cur !== stage) restore();
+      }
+      document.addEventListener("fullscreenchange", onChange);
+      document.addEventListener("webkitfullscreenchange", onChange);
+      return { stage, restore };
+    }
+    function request(video, opts, native) {
+      const { stage, restore } = openStage(video);
+      const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
+      const fallback = () => {
+        restore();
+        if (typeof native === "function") return native.call(video, opts);
+        return Promise.reject(new Error("fullscreen unavailable"));
+      };
+      if (!req) return fallback();
+      try {
+        const result = req.call(stage, opts);
+        if (result && typeof result.then === "function") return result.catch(() => fallback());
+        return result;
+      } catch (err) {
+        return fallback();
+      }
+    }
+    if (typeof orig === "function") {
+      proto.requestFullscreen = function (opts) { return request(this, opts, orig); };
+    }
+    if (typeof origWebkit === "function") {
+      proto.webkitRequestFullscreen = function () { return request(this, undefined, origWebkit); };
+    }
+    if (typeof origEnter === "function") {
+      proto.webkitEnterFullscreen = function () { return request(this, undefined, origEnter); };
+    }
+  }
+  installNativeSizeFullscreen();
+
   bindCompareButton("resultCompareBtn", "resultImg", "resultSourceImg");
   bindCompareButton("sheetCompare", "sheetImg", "sheetSourceImg");
 

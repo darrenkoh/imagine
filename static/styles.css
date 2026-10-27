@@ -592,14 +592,43 @@ textarea { min-height: 96px; resize: vertical; line-height: 1.4; }
   max-height: 70vh;
 }
 .sheet-video { max-height: 60vh; }
-/* The fullscreen UA stylesheet fits the frame to the screen (object-fit: contain).
-   scale-down keeps the clip at its own pixel size and only shrinks it when it
-   is larger than the screen. */
+/* Fullscreen the stage, not the video. The UA stylesheet forces a fullscreen
+   video to width/height 100% and ignores author size, so the picture is scaled
+   to the screen. The stage is the fullscreen element; the clip stays at its
+   own pixel size and only shrinks when it is larger than the screen. */
+.fs-stage {
+  position: fixed;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+.fs-stage:fullscreen,
+.fs-stage:-webkit-full-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  background: #000;
+}
+.fs-stage:fullscreen video,
+.fs-stage:-webkit-full-screen video {
+  width: auto !important;
+  height: auto !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+  position: static !important;
+  inset: auto !important;
+  margin: 0 !important;
+  transform: none !important;
+  object-fit: contain !important;
+  border-radius: 0;
+  background: #000;
+}
 #resultVideo:fullscreen,
 #sheetVideo:fullscreen,
 #resultVideo:-webkit-full-screen,
 #sheetVideo:-webkit-full-screen {
-  object-fit: scale-down;
+  object-fit: scale-down !important;
   background: #000;
   border-radius: 0;
 }
