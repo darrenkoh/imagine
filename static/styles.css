@@ -592,6 +592,17 @@ textarea { min-height: 96px; resize: vertical; line-height: 1.4; }
   max-height: 70vh;
 }
 .sheet-video { max-height: 60vh; }
+/* The fullscreen UA stylesheet fits the frame to the screen (object-fit: contain).
+   scale-down keeps the clip at its own pixel size and only shrinks it when it
+   is larger than the screen. */
+#resultVideo:fullscreen,
+#sheetVideo:fullscreen,
+#resultVideo:-webkit-full-screen,
+#sheetVideo:-webkit-full-screen {
+  object-fit: scale-down;
+  background: #000;
+  border-radius: 0;
+}
 .gitem .play-badge {
   position: absolute;
   left: 8px;
